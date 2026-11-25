@@ -97,7 +97,7 @@ for t in tests/*.nim; do nim r --path:src "$t"; done
 |---|---|
 | `tests/test_sim.nim` | world integrity, the seeded setup, determinism, the initiative rotation, the price curve by hand, restock, partial credit, contention, robbery in all four cases, the retainer, rune-safe truncation, the wasm integer width, the observation split, replay re-derivation and its tamper check, and the two endings |
 | `tests/test_parse.nim` | a table of sentences to expected intents and slots covering every verb synonym, the whole phrasebook, verb precedence, speech lifting, the failure vocabulary and robustness against junk |
-| `tests/test_bot.nim` | the baselines are legal and bounded by construction, emit **zero** unreadable sentences across a full episode, and the no-credentials client decides scripted with no network wait |
+| `tests/test_bot.nim` | the baselines are legal and bounded by construction, emit **zero** unreadable sentences across a full episode, explicitly scripted seats run with no credentials, and model seats fail explicitly on missing credentials or failed replies (no implicit fallback) |
 | `tests/test_score.nim` | the scoring formula, its sign, the worked landmark, and what the league ranks by |
 | `tests/test_feasibility.nim` | the greedy commission plan fits inside `turns - 2` and the starting purse over 200 seeds × 6 seats |
 | `tests/test_viewer.nim` | chrome provenance (byte-for-byte against the starter), the element inventory, the scope-collision guard, and that the emscripten link flags and the JS bootstrap are a matched pair |

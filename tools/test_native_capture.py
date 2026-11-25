@@ -16,6 +16,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
+class FixtureServer(ThreadingHTTPServer):
+    def __init__(self, address, handler, *, fail_turn=None):
+        super().__init__(address, handler)
+        self.fail_turn = fail_turn
+        self.calls_lock = threading.Lock()
+        self.called_slots = []
+
+
 class Provider(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -28,11 +36,15 @@ class Provider(BaseHTTPRequestHandler):
         user = body["messages"][0]["content"]
         turn = int(re.match(r"Turn (\d+) of", user).group(1))
         slot = self.headers["X-Coworld-Player-Slot"]
+        with self.server.calls_lock:
+            self.server.called_slots.append((turn, int(slot)))
         assert "PRIVATE_OPERATOR_" + slot in user
         assert all("PRIVATE_OPERATOR_" + str(i) not in user for i in range(6) if str(i) != slot)
         assert "SPECTATOR_POLICY_" not in user and "SPECTATOR_POLICY_" not in body["system"]
         retry = "Your previous reply was invalid" in user
-        if turn == 2 or (turn == 1 and not retry):
+        if self.server.fail_turn is not None and turn == self.server.fail_turn:
+            text = "invalid fixture reply"
+        elif turn == 1 and not retry:
             text = "invalid fixture reply"
         else:
             notes = "PRIVATE_CAPTURE_" + slot
@@ -48,6 +60,8 @@ class Provider(BaseHTTPRequestHandler):
                 action.pop("say")
                 action.pop("notes")
             text = json.dumps(action)
+            if turn == 2:
+                text = f"```json\n{text}\n```"
         response = json.dumps(
             {
                 "model": body["model"],
@@ -64,8 +78,20 @@ class Provider(BaseHTTPRequestHandler):
         self.wfile.write(response)
 
 
-def run(game, player, output, variant, capture, model_enabled=True):
-    root = output / f"{variant['id']}-capture{capture}{'' if model_enabled else '-offline'}"
+def run(
+    game,
+    player,
+    output,
+    variant,
+    capture,
+    *,
+    label,
+    seat_modes,
+    model_enabled=True,
+    fail_turn=None,
+    expect_failure=False,
+):
+    root = output / label
     root.mkdir(mode=0o700)
     config = dict(variant["game_config"])
     seats = 6
@@ -92,13 +118,14 @@ def run(game, player, output, variant, capture, model_enabled=True):
         "AWS_BEARER_TOKEN_BEDROCK",
     ):
         env.pop(key, None)
-    episode = f"cogmud-native-capture-fixture-{variant['id']}"
+    episode = f"cogmud-native-capture-fixture-{label}"
     env.update(
         COGAME_HOST="127.0.0.1",
         COGAME_PORT=str(port),
         COGAME_CONFIG_URI=(root / "config.json").as_uri(),
         COGAME_RESULTS_URI=(root / "results.json").as_uri(),
         COGAME_SAVE_REPLAY_URI=(root / "replay.json").as_uri(),
+        COGAME_PLAYER_FAILURE_URI=(root / "player_failure.json").as_uri(),
         COGAME_SAVE_TRAJECTORY_URI=(root / "trajectory.jsonl").as_uri(),
         COWORLD_EPISODE_ID=episode,
         COWORLD_GAME_VERSION="identity-fixture",
@@ -106,7 +133,7 @@ def run(game, player, output, variant, capture, model_enabled=True):
     )
     if not capture:
         env.pop("COGAME_SAVE_TRAJECTORY_URI")
-    provider = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
+    provider = FixtureServer(("127.0.0.1", 0), Provider, fail_turn=fail_turn)
     thread = threading.Thread(target=provider.serve_forever, daemon=True)
     thread.start()
     if model_enabled:
@@ -133,22 +160,72 @@ def run(game, player, output, variant, capture, model_enabled=True):
             log = (root / f"player-{seat}.log").open("wb")
             streams.append(log)
             player_env = dict(env, PLAYER_PROMPT=f"PRIVATE_OPERATOR_{seat}", COWORLD_TIMEOUT_SECONDS="600")
+            if seat_modes[seat]:
+                player_env["PLAYER_SCRIPTED"] = seat_modes[seat]
+            else:
+                player_env.pop("PLAYER_SCRIPTED", None)
             player_env["COWORLD_PLAYER_WS_URL"] = f"ws://127.0.0.1:{port}/player?slot={seat}&token=fixture-{seat}"
             children.append(subprocess.Popen([str(player)], env=player_env, stdout=log, stderr=subprocess.STDOUT))
-        assert server.wait(timeout=360) == 0
+
+        rc = server.wait(timeout=360)
         for child in children[1:]:
-            assert child.wait(timeout=5) == 0
+            assert child.wait(timeout=10) == 0
+
+        if expect_failure:
+            assert rc != 0, f"expected explicit failure for {label}, got exit 0"
+            assert not (root / "results.json").exists(), "failed episode must not write results.json"
+            failure = json.loads((root / "player_failure.json").read_text())
+            assert failure["reason"]
+            if fail_turn is not None:
+                assert "invalid fixture reply" in failure["raw_response"]
+            if capture:
+                trace = root / "trajectory.jsonl"
+                rows = [json.loads(line) for line in trace.read_text().splitlines()]
+                assert rows[-1]["status"] == "failed"
+                failed_row = rows[-2]
+                assert failed_row["selected_attempt_id"] is None
+                assert failed_row["executed_action"] is None
+                if fail_turn is not None:
+                    assert failed_row["action_status"] == "rejected"
+                    assert len(failed_row["attempts"]) == 2
+                    assert all(not a["accepted"] for a in failed_row["attempts"])
+                    assert "invalid fixture reply" in failed_row["attempts"][-1]["raw_response"]
+                else:
+                    assert failed_row["action_status"] == "missing"
+            return failure
+
+        assert rc == 0, f"expected exit 0 for {label}, got {rc}"
+        assert not (root / "player_failure.json").exists()
         results = json.loads((root / "results.json").read_text())
         replay = json.loads((root / "replay.json").read_text())
         assert results["reason"] == "complete"
         assert results["turns"] == config["turns"] == 14
+
+        model_seats = {seat for seat, mode in enumerate(seat_modes) if not mode}
+        called_seat_ids = {slot for _, slot in provider.called_slots}
+        if model_seats:
+            assert called_seat_ids == model_seats, f"expected HTTP calls for {model_seats}, got {called_seat_ids}"
+        else:
+            assert not called_seat_ids, f"scripted-only game should make zero HTTP calls, got {called_seat_ids}"
+
+        events = [event for event in replay["events"] if event["kind"] == "act"]
+        assert len(events) == 84
+        for event in events:
+            seat = event["seat"]
+            turn = event["turn"] + 1
+            if seat in model_seats:
+                assert not event["scripted"]
+                expected_sentence = "flibbertigibbet" if turn == 4 else "I wait by the well and listen."
+                assert event["sentence"] == expected_sentence
+            else:
+                assert event["scripted"]
+
         if capture:
             trace = root / "trajectory.jsonl"
             rows = [json.loads(line) for line in trace.read_text().splitlines()]
             assert trace.stat().st_mode & 0o077 == 0
             assert rows[-1]["status"] == "completed" and rows[-1]["outcome"] == results
             assert rows[-1]["seed_family"] == "cogmud-42"
-            events = [event for event in replay["events"] if event["kind"] == "act"]
             assert len(events) == len(rows) - 1 == 84
             assert {row["decision_id"] for row in rows[:-1]} == {
                 f"event-{i}" for i, event in enumerate(replay["events"]) if event["kind"] == "act"
@@ -169,9 +246,8 @@ def run(game, player, output, variant, capture, model_enabled=True):
                 view = json.dumps(row["observation"], ensure_ascii=False)
                 assert all(f"PRIVATE_CAPTURE_{i}" not in view for i in range(6) if i != seat)
                 assert f"PUBLIC_TURN_{turn}_" not in json.dumps(row["observation"]["heard"])
-                if not model_enabled:
-                    assert row["action_status"] == "fallback"
-                    assert row["selected_attempt_id"] is None
+                if seat not in model_seats:
+                    assert row["action_status"] == "accepted"
                     assert len(row["attempts"]) == 1 and row["attempts"][0]["origin"] == "unknown"
                     assert row["attempts"][0]["platform_call_id"] is None
                     continue
@@ -180,10 +256,6 @@ def run(game, player, output, variant, capture, model_enabled=True):
                     assert len(attempts) == 2 and not attempts[0]["accepted"]
                     assert attempts[1]["accepted"]
                     assert row["selected_attempt_id"] == attempts[1]["attempt_id"]
-                elif turn == 2:
-                    assert row["action_status"] == "fallback"
-                    assert row["selected_attempt_id"] is None and len(attempts) == 2
-                    assert event["scripted"]
                 elif turn == 3:
                     assert row["action_status"] == "rejected" and row["selected_attempt_id"] is None
                     assert not attempts[0]["accepted"]
@@ -226,22 +298,54 @@ def main():
     game, player, destination = map(lambda value: Path(value).resolve(), sys.argv[1:])
     destination.mkdir(mode=0o700, exist_ok=False)
     manifest = json.loads((Path(__file__).resolve().parents[1] / "coworld_manifest_template.json").read_text())
+    mixed_modes = ["", "factor", "", "magpie", "factor", ""]
+    baseline_modes = ["factor", "factor", "factor", "magpie", "factor", "factor"]
     with ThreadPoolExecutor(max_workers=4) as pool:
         futures = [
             (
-                pool.submit(run, game, player, destination, variant, True),
-                pool.submit(run, game, player, destination, variant, False),
+                pool.submit(
+                    run, game, player, destination, variant, True,
+                    label=f"{variant['id']}-mixed-captureTrue", seat_modes=mixed_modes,
+                ),
+                pool.submit(
+                    run, game, player, destination, variant, False,
+                    label=f"{variant['id']}-mixed-captureFalse", seat_modes=mixed_modes,
+                ),
             )
             for variant in manifest["variants"]
         ]
         for captured, ordinary in futures:
             assert captured.result() == ordinary.result(), "capture changed the native outcome or replay"
-    captured = run(game, player, destination, manifest["variants"][0], True, model_enabled=False)
-    ordinary = run(game, player, destination, manifest["variants"][0], False, model_enabled=False)
-    assert captured == ordinary, "capture changed the offline fallback game"
+
+    # Explicit baseline-only game completes offline with zero HTTP calls.
+    captured = run(
+        game, player, destination, manifest["variants"][0], True,
+        label="standard-baselines-captureTrue", seat_modes=baseline_modes, model_enabled=False,
+    )
+    ordinary = run(
+        game, player, destination, manifest["variants"][0], False,
+        label="standard-baselines-captureFalse", seat_modes=baseline_modes, model_enabled=False,
+    )
+    assert captured == ordinary, "capture changed the baseline-only game"
+
+    # Unrecovered model reply failure ends explicitly and preserves raw data.
+    run(
+        game, player, destination, manifest["variants"][0], True,
+        label="standard-model-reply-failure", seat_modes=mixed_modes,
+        model_enabled=True, fail_turn=2, expect_failure=True,
+    )
+
+    # Model seat with no credentials fails explicitly (no implicit fallback).
+    run(
+        game, player, destination, manifest["variants"][0], True,
+        label="standard-missing-creds-failure", seat_modes=mixed_modes,
+        model_enabled=False, expect_failure=True,
+    )
+
     print(
-        "six complete native games: replay parity, resolution-order joins, retries, fallback, "
-        "normalization, legal no-op, privacy, missing usage and offline fallback pass"
+        "eight native games: HTTP model vs explicit baselines, replay parity, retries, "
+        "markdown JSON fence, normalization, legal no-op, privacy, missing usage, "
+        "offline baselines, and explicit failure without fallback pass"
     )
 
 

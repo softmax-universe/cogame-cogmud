@@ -4,17 +4,19 @@
 
 The ordinary game server can write a private JSONL decision artifact when
 `COGAME_SAVE_TRAJECTORY_URI` is set. Capture preserves the six-seat parallel
-requests, native retry/fallback behavior, 12-second batch floor, and all fourteen
-turns. Each request retains the exact prompt, decoder settings, received response,
-platform call ID, and available usage/identity fields. Missing usage is unknown.
+requests, native retry and explicit failure behavior, 12-second batch floor,
+and all fourteen turns. Each request retains the exact prompt, decoder settings,
+received response, platform call ID, and available usage/identity fields.
+Missing usage is unknown.
 
 All six private observations are frozen before any submission. After the sixth
 submission resolves the town, each actual act event is joined by seat to its
 original observation and attempts, in the engine's class/initiative order.
 Only unchanged model replies can be selected; optional omitted say/notes fields
 use their native empty defaults for equality only. Parser or engine normalization
-excludes selection without changing the stored response. Scripted and offline
-fallbacks cannot become model teaching targets. Authenticate platform receipts
+excludes selection without changing the stored response. Unrecovered model
+failures end the episode explicitly with `status: "failed"`, preserving raw
+attempts without substituting a scripted action. Authenticate platform receipts
 with the maintained research collector before training.
 
 An unrecognized sentence is a legal no-op, not a failed JSON request: it is

@@ -333,13 +333,17 @@
           "cpu": "1"
         }
       },
-      "source_url": "https://github.com/softmax-universe/cogame-cogmud/tree/main"
+      "source_url": "https://github.com/softmax-universe/cogame-cogmud/tree/main",
+      "env": {
+        "COWORLD_LLM_ENABLED": "true",
+        "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5"
+      }
     },
     {
       "id": "cogmud-factor",
       "name": "Cogmud Factor Baseline",
       "type": "player",
-      "description": "The scripted quest-and-trade baseline as a fieldable policy: hands Vell what a commission still needs, buys what it is short of where it is stocked, sells surplus into a shop that is paying over the odds, picks up anything valuable, and otherwise walks the shortest path toward the next thing it needs. Never robs, never hires, never speaks. This is also the universal fallback for any failed LLM decision, so an episode always completes.",
+      "description": "The scripted quest-and-trade baseline as a fieldable policy: hands Vell what a commission still needs, buys what it is short of where it is stocked, sells surplus into a shop that is paying over the odds, picks up anything valuable, and otherwise walks the shortest path toward the next thing it needs. Never robs, never hires, never speaks.",
       "image": "{{COGMUD_IMAGE}}",
       "run": [
         "/bin/cogmud-player"
@@ -486,7 +490,7 @@
         "player_id": "cogmud-factor"
       },
       {
-        "player_id": "cogmud-player"
+        "player_id": "cogmud-magpie"
       },
       {
         "player_id": "cogmud-magpie"
@@ -495,7 +499,7 @@
         "player_id": "cogmud-factor"
       },
       {
-        "player_id": "cogmud-player"
+        "player_id": "cogmud-factor"
       }
     ]
   }

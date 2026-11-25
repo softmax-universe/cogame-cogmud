@@ -5,7 +5,7 @@
 ## actual decision making happens inside the game server, which sends this
 ## seat's prompt to Claude every turn.
 ##
-## PLAYER_SCRIPTED=factor (or 1) registers the seat as the built-in
+## PLAYER_SCRIPTED=factor registers the seat as the built-in
 ## quest-and-trade baseline instead; PLAYER_SCRIPTED=magpie as the
 ## thief-peddler. The server plays those deterministically, no LLM.
 ##
@@ -40,7 +40,9 @@ when isMainModule:
   var prompt = getEnv("PLAYER_PROMPT")
   if prompt.len == 0:
     prompt = DefaultPrompt
-  let scripted = getEnv("PLAYER_SCRIPTED").strip()
+  let scripted = getEnv("PLAYER_SCRIPTED").strip().toLowerAscii()
+  if scripted notin ["", "none", "factor", "magpie"]:
+    quit("PLAYER_SCRIPTED must be empty, none, factor, or magpie (got: " & scripted & ")", 1)
 
   proc promptFrame(): string =
     $ %*{"type": "prompt", "prompt": prompt, "scripted": scripted}
