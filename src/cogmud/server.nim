@@ -19,7 +19,7 @@
 ##                   {"type":"final","scores":[...],"names":[...],...}
 ##   player -> game: {"type":"prompt","prompt":"...","scripted":"factor"}
 ##                   (max 4000 runes; scripted plays a built-in baseline for
-##                   that seat: "factor" / "1", or "magpie")
+##                   that seat: "factor", "magpie", or "" / "none" for LLM)
 
 import
   std/[json, locks, os, sets, strutils, tables, times, unicode],
@@ -211,6 +211,75 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
   echo "cogmud: episode complete, shutting down"
   quit(0)
 
+proc failEpisode(
+  seat: int,
+  reason: string,
+  rawResponse: string,
+  captureViews: seq[JsonNode],
+  attempts: seq[seq[DecisionAttempt]]
+) =
+  var failurePayload: JsonNode
+  withLock stateLock:
+    if state.finished:
+      return
+    state.finished = true
+    let results = state.sim.resultsJson()
+    let playerName =
+      if seat >= 0 and seat < state.config.players.len:
+        state.config.players[seat].name
+      else:
+        ""
+    failurePayload = %*{
+      "seat": seat,
+      "player": playerName,
+      "turn": state.sim.turn,
+      "reason": reason,
+      "raw_response": rawResponse
+    }
+    if not state.trajectory.isNil:
+      let view =
+        if seat >= 0 and seat < captureViews.len and not captureViews[seat].isNil:
+          captureViews[seat]
+        elif seat >= 0 and seat < Seats:
+          state.sim.playerStateJson(seat)
+        else:
+          newJObject()
+      let seatAttempts =
+        if seat >= 0 and seat < attempts.len: attempts[seat]
+        else: @[]
+      state.trajectory.recordFailedDecision(state.sim.events.len, seat,
+        playerName, view, seatAttempts, state.selection, reason)
+      state.trajectory.finishFailedNativeTrajectory(failurePayload, results)
+    var aliasNames = newJArray()
+    for name in state.sim.names:
+      aliasNames.add(%name)
+    var final = %*{
+      "type": "final",
+      "done": true,
+      "scores": results["scores"],
+      "names": aliasNames,
+      "wealth": results["wealth"],
+      "questPoints": results["questPoints"],
+      "turns": results["turns"],
+      "reason": "failed",
+      "error": reason
+    }
+    for slot, socket in state.playerSockets:
+      final["slot"] = %slot
+      socket.send($final)
+    state.broadcastLocked()
+
+  sleep(500)
+  let failureUri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
+  if failureUri.len > 0:
+    echo "cogmud: writing player failure artifact"
+    writeArtifact(
+      failureUri, $failurePayload, "application/json",
+      "COGAME_PLAYER_FAILURE_METHOD"
+    )
+  echo "cogmud: episode failed (seat ", seat, "): ", reason
+  quit(1)
+
 proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
   {.gcsafe.}:
     let config = state.config
@@ -280,9 +349,14 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
 
       ## Rate floor. Six live seats at one request each is 30 requests a minute
       ## exactly at a 12 s floor, which is the hosted Bedrock sidecar's
-      ## per-episode cap. Skipped entirely when the client is disabled, so
-      ## docker-smoke and offline certification never sleep on it.
-      if not client.disabled and lastBatchAt > 0.0:
+      ## per-episode cap. Skipped when all seats are explicitly scripted
+      ## baselines, so docker-smoke and offline certification never sleep on it.
+      var hasModelSeat = false
+      for seat in seats:
+        if scripted[seat] == skNone:
+          hasModelSeat = true
+          break
+      if hasModelSeat and lastBatchAt > 0.0:
         let waitMs = MinBatchSpacingMs -
           int((epochTime() - lastBatchAt) * 1000.0)
         if waitMs > 0:
@@ -297,18 +371,22 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       var captureViews = newSeq[JsonNode](Seats)
       if not state.trajectory.isNil:
         for seat in seats: captureViews[seat] = simCopy.playerStateJson(seat)
-      let decisions = client.decideAll(state.selection, simCopy, seats, prompts, scripted)
+      var decisions: seq[Decision]
+      try:
+        decisions = client.decideAll(state.selection, simCopy, seats, prompts, scripted)
+      except ModelDecisionError as error:
+        failEpisode(error.seat, error.msg, error.rawResponse, captureViews,
+          client.nativeAttempts)
 
+      var applyFailed = false
+      var applyFailSeat = -1
+      var applyFailReason = ""
+      var applyFailRaw = ""
       withLock stateLock:
         let firstEvent = state.sim.events.len
         for index, seat in seats:
           let decision = decisions[index]
-          ## True for a baseline seat, for a whole episode with no
-          ## credentials, AND for an LLM seat whose two attempts both failed:
-          ## the act event records what actually decided it, so phase 60 can
-          ## count fallbacks off the replay as well as off the stdout log.
-          let wasScripted = scripted[seat] != skNone or client.disabled or
-            client.fellBack[seat]
+          let wasScripted = scripted[seat] != skNone
           echo "cogmud: turn ", state.sim.turn + 1, " ",
             state.sim.names[seat], ": \"", decision.sentence, "\"",
             (if decision.say.len > 0: " says \"" & decision.say & "\"" else: "")
@@ -316,24 +394,25 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             state.sim.applyAction(seat, decision.sentence, decision.say,
               decision.notes, wasScripted)
           except CogmudError as error:
-            ## Unreachable after the parser's pre-checks; a belt-and-braces
-            ## guard, as in bullwhip's server.
-            echo "cogmud: action rejected (", error.msg, "); waiting instead"
-            try:
-              state.sim.applyAction(seat, "I wait and watch the road.", "", "",
-                true)
-            except CogmudError:
-              discard
-        if not state.trajectory.isNil:
-          for eventIndex in firstEvent ..< state.sim.events.len:
-            let applied = state.sim.events[eventIndex]
-            if applied.kind != evAct: continue
-            let seat = applied.seat
-            state.trajectory.recordAppliedDecision(eventIndex, seat,
-              config.players[seat].name, captureViews[seat], applied.executedReply(),
-              applied.scripted, scripted[seat] != skNone, client.nativeAttempts[seat],
-              state.selection)
-        state.broadcastLocked()
+            applyFailed = true
+            applyFailSeat = seat
+            applyFailReason = "engine rejected action: " & error.msg
+            applyFailRaw = $decision.decisionReply()
+            break
+        if not applyFailed:
+          if not state.trajectory.isNil:
+            for eventIndex in firstEvent ..< state.sim.events.len:
+              let applied = state.sim.events[eventIndex]
+              if applied.kind != evAct: continue
+              let seat = applied.seat
+              state.trajectory.recordAppliedDecision(eventIndex, seat,
+                config.players[seat].name, captureViews[seat], applied.executedReply(),
+                scripted[seat] != skNone, client.nativeAttempts[seat],
+                state.selection)
+          state.broadcastLocked()
+      if applyFailed:
+        failEpisode(applyFailSeat, applyFailReason, applyFailRaw, captureViews,
+          client.nativeAttempts)
 
       ## Pace between turns so spectators can read the town.
       if config.turnDelayMs > 0:
@@ -462,9 +541,9 @@ proc websocketHandler(
             prompt = prompt.runeSubStr(0, MaxPromptLen)
           let node = payload{"scripted"}
           let scripted =
-            if node.isNil: skNone
-            elif node.kind == JBool: (if node.getBool(): skFactor else: skNone)
-            else: parseScriptKind(node.getStr())
+            if node.isNil or node.kind == JNull: skNone
+            elif node.kind == JString: parseScriptKind(node.getStr())
+            else: raise newException(CogmudError, "scripted must be a string")
           withLock stateLock:
             state.prompts[slot] = prompt
             state.scripted[slot] = scripted

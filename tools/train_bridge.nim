@@ -129,12 +129,17 @@ proc encode(): JsonNode =
 proc step(command: JsonNode): JsonNode =
   if command["decision_id"].getInt() != decisionId:
     return %*{"kind": "rejected", "reason": "stale decision"}
-  let action = parseJson(command["response"].getStr())
-  var accepted = action
+  var accepted: JsonNode
   if languageMode:
-    proposals[seats[cursor]] = parseDecision(action)
-    accepted = proposals[seats[cursor]].decisionReply()
+    try:
+      let payload = extractJsonObject(command["response"].getStr())
+      proposals[seats[cursor]] = parseDecision(payload)
+      accepted = proposals[seats[cursor]].decisionReply()
+    except CatchableError as error:
+      return %*{"kind": "rejected", "reason": error.msg}
   else:
+    let action = parseJson(command["response"].getStr())
+    accepted = action
     let choice = action["choice"].getInt()
     doAssert choice in 0 .. 1
     choices[seats[cursor]] = choice
@@ -151,7 +156,7 @@ proc step(command: JsonNode): JsonNode =
     for seat in seats:
       let decision = decisions[seat]
       game.applyAction(seat, decision.sentence, decision.say,
-        decision.notes, true)
+        decision.notes, not languageMode)
     seats = game.pendingSeats()
     cursor = 0
   let observation = if game.done:

@@ -29,9 +29,8 @@ proc allOf(kind: ScriptKind): Table6 =
 
 const Mixed: Table6 = [skMagpie, skFactor, skFactor, skMagpie, skFactor,
   skMagpie]
-## The certification fixture's offline seat mix: cogmud-player, cogmud-factor,
-## cogmud-player, cogmud-magpie, cogmud-factor, cogmud-player. With no
-## credentials every prompt seat plays `factor`.
+## A six-seat baseline mix (five factor seats and one magpie seat) on seed 11
+## used to verify the robbery path without an LLM.
 const CertMix: Table6 = [skFactor, skFactor, skFactor, skMagpie, skFactor,
   skFactor]
 
@@ -188,10 +187,26 @@ suite "baseline behaviour":
       check run.sim.cogs[seat].robbed == 0
 
 # 3 -------------------------------------------------------------------------
-suite "the no-credentials fallback":
-  test "a disabled client decides scripted for all six seats, with no wait":
-    ## CI never sets ANTHROPIC_API_KEY and the sidecar env is absent, so this
-    ## is exactly the path docker-smoke and offline certification take.
+suite "no implicit fallback":
+  proc clearLlmEnv(): seq[(string, string)] =
+    for key in [
+      "COWORLD_LLM_ENDPOINT", "COWORLD_LLM_MODEL",
+      "AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "AWS_BEARER_TOKEN_BEDROCK",
+      "ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY_URI"
+    ]:
+      if existsEnv(key):
+        result.add((key, getEnv(key)))
+        delEnv(key)
+
+  proc restoreLlmEnv(saved: seq[(string, string)]) =
+    for pair in saved:
+      putEnv(pair[0], pair[1])
+
+  test "explicitly scripted seats complete with no credentials and no wait":
+    ## CI never sets ANTHROPIC_API_KEY and the sidecar env is absent, so
+    ## certification and docker-smoke explicitly select baseline policies.
+    let saved = clearLlmEnv()
+    defer: restoreLlmEnv(saved)
     var config = fixtureConfig(seed = 91)
     let client = newLlmClient(config)
     check client.disabled
@@ -202,7 +217,7 @@ suite "the no-credentials fallback":
     while not sim.done:
       let seats = sim.pendingSeats()
       var prompts = newSeq[string](Seats)
-      var scripted = newSeq[ScriptKind](Seats)
+      var scripted = @CertMix
       let decisions = client.decideAll(PromptSelection(), sim, seats, prompts, scripted)
       check decisions.len == Seats
       for index, seat in seats:
@@ -212,20 +227,31 @@ suite "the no-credentials fallback":
           decisions[index].notes, true)
       inc turns
     let elapsed = (getMonoTime() - started).inMilliseconds
-    checkpoint("14 disabled turns in " & $elapsed & "ms")
+    checkpoint("14 scripted turns in " & $elapsed & "ms")
     check turns == 14
     ## No network call and no batch-spacing sleep: well under five seconds.
     check elapsed < 5000
 
-  test "a dead endpoint retries once, falls back, and SAYS it fell back":
-    ## The fallback used to leave no trace on the act event: the server
-    ## computed `scripted` from the seat's configuration alone, so an LLM seat
-    ## that failed twice was recorded as an LLM decision. decideAll now marks
-    ## the seat, and server.nim stamps that onto the event, so a fallback is
-    ## countable from the replay and not only from the stdout log.
-    ##
+  test "a model seat with no credentials fails explicitly instead of falling back":
+    let saved = clearLlmEnv()
+    defer: restoreLlmEnv(saved)
+    var config = fixtureConfig(seed = 91)
+    let client = newLlmClient(config)
+    check client.disabled
+
+    let sim = initSim(config)
+    let seats = sim.pendingSeats()
+    var prompts = newSeq[string](Seats)
+    var scripted = @CertMix
+    scripted[0] = skNone
+    expect ModelDecisionError:
+      discard client.decideAll(PromptSelection(), sim, seats, prompts, scripted)
+
+  test "a dead endpoint retries once and fails explicitly with no scripted fallback":
     ## The endpoint is 127.0.0.1:9 - discard, always refused - so this drives
     ## the real transport-failure path without touching the network.
+    let saved = clearLlmEnv()
+    defer: restoreLlmEnv(saved)
     putEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "http://127.0.0.1:9")
     putEnv("AWS_BEARER_TOKEN_BEDROCK", "not-a-token")
     defer:
@@ -236,20 +262,12 @@ suite "the no-credentials fallback":
     let client = newLlmClient(config)
     check not client.disabled
 
-    var sim = initSim(config)
+    let sim = initSim(config)
     let seats = sim.pendingSeats()
     var prompts = newSeq[string](Seats)
     var scripted = newSeq[ScriptKind](Seats)
-    let started = getMonoTime()
-    let decisions = client.decideAll(PromptSelection(), sim, seats, prompts, scripted)
-    checkpoint("six refused requests in " &
-      $(getMonoTime() - started).inMilliseconds & "ms")
-    check decisions.len == Seats
-    for index, seat in seats:
-      ## Every seat played, legally, and every seat is marked as a fallback.
-      check decisions[index].sentence.len > 0
-      check client.fellBack[seat]
-      check parseSentence(sim, seat, decisions[index].sentence).kind != iNone
+    expect ModelDecisionError:
+      discard client.decideAll(PromptSelection(), sim, seats, prompts, scripted)
 
 # 4 -------------------------------------------------------------------------
 suite "reply parsing":
@@ -266,6 +284,11 @@ suite "reply parsing":
     check bare.say == ""
     check bare.notes == ""
 
+    let nullOpt = parseDecision(parseJson("""{"action":"I wait.","say":null,"notes":null}"""))
+    check nullOpt.sentence == "I wait."
+    check nullOpt.say == ""
+    check nullOpt.notes == ""
+
     let extra = parseDecision(parseJson(
       """{"action":"I wait.","mood":"grim","plan":[1,2]}"""))
     check extra.sentence == "I wait."
@@ -281,7 +304,7 @@ suite "reply parsing":
       """{"action":"I go\nto the Docks."}"""))
     check "\n" notin newlines.sentence
 
-  test "a missing or empty action is invalid and therefore retryable":
+  test "a missing, empty, or wrong-typed field is invalid and therefore retryable":
     expect CogmudError:
       discard parseDecision(parseJson("""{"say":"hello"}"""))
     expect CogmudError:
@@ -290,6 +313,10 @@ suite "reply parsing":
       discard parseDecision(parseJson("""{"action":12}"""))
     expect CogmudError:
       discard parseDecision(parseJson("""[1,2,3]"""))
+    expect CogmudError:
+      discard parseDecision(parseJson("""{"action":"I wait.","say":123}"""))
+    expect CogmudError:
+      discard parseDecision(parseJson("""{"action":"I wait.","notes":[]}"""))
 
   test "an unreadable but present action is VALID, never a retry":
     ## The seat said something; the town did not understand it. That is a legal
@@ -300,12 +327,15 @@ suite "reply parsing":
     let sim = initSim(fixtureConfig(seed = 92))
     check parseSentence(sim, 0, decision.sentence).kind == iNone
 
-  test "JSON is extracted from fences and trailing prose":
+  test "raw JSON and standard outer Markdown JSON fences are accepted; prose is rejected":
+    check parseDecision(extractJsonObject(
+      """{"action": "I wait."}""")).sentence == "I wait."
     check parseDecision(extractJsonObject(
       "```json\n{\"action\": \"I wait.\"}\n```")).sentence == "I wait."
     check parseDecision(extractJsonObject(
-      "Sure! {\"action\": \"I wait.\"} Hope that helps.")).sentence ==
-      "I wait."
+      "```\n{\"action\": \"I wait.\"}\n```")).sentence == "I wait."
+    expect CogmudError:
+      discard extractJsonObject("Sure! {\"action\": \"I wait.\"} Hope that helps.")
     expect CogmudError:
       discard extractJsonObject("no object here at all")
 
@@ -315,12 +345,11 @@ suite "reply parsing":
     check cut.validateUtf8() == -1
     check cut.endsWith("\u2026")
 
-  test "PLAYER_SCRIPTED values map to the two baselines":
-    check parseScriptKind("factor") == skFactor
-    check parseScriptKind("1") == skFactor
-    check parseScriptKind("true") == skFactor
-    check parseScriptKind("yes") == skFactor
-    check parseScriptKind("magpie") == skMagpie
-    check parseScriptKind("thief") == skMagpie
+  test "PLAYER_SCRIPTED accepts only canonical values and rejects aliases":
     check parseScriptKind("") == skNone
-    check parseScriptKind("nonsense") == skNone
+    check parseScriptKind("none") == skNone
+    check parseScriptKind("factor") == skFactor
+    check parseScriptKind("magpie") == skMagpie
+    for alias in ["1", "true", "yes", "thief", "nonsense"]:
+      expect CogmudError:
+        discard parseScriptKind(alias)

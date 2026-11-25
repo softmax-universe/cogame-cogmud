@@ -77,12 +77,25 @@ for game, maximum in (("standard", 84), ("honest-town", 84)):
                     action["notes"] = f"PRIVATE-{seat}"
                     if obs["decision_id"] == 0:
                         action["action"] = "zzinvalidzz"
+                    if obs["decision_id"] == 1:
+                        rejected = request(
+                            process,
+                            {
+                                "kind": "step",
+                                "decision_id": obs["decision_id"],
+                                "response": "Sure! " + json.dumps(action) + " Thanks!",
+                            },
+                        )
+                        assert rejected["kind"] == "rejected"
+                        raw_response = "```json\n" + json.dumps(action) + "\n```"
+                    else:
+                        raw_response = json.dumps(action)
                     response = request(
                         process,
                         {
                             "kind": "step",
                             "decision_id": obs["decision_id"],
-                            "response": json.dumps(action),
+                            "response": raw_response,
                         },
                     )
                     assert response["kind"] == "accepted"

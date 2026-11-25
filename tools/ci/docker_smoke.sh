@@ -38,9 +38,11 @@
 #                              job loads it in a real browser -- that is the
 #                              only replay in CI that is known to be readable
 #                              by this game's own viewer.
-#   ANTHROPIC_API_KEY          if set, forwarded to the game so the LLM path
-#                              is exercised; if unset the game must fall back
-#                              to its scripted baselines and still complete
+#   ANTHROPIC_API_KEY          if set, forwarded to the game; if neither
+#                              COWORLD_LLM_ENDPOINT nor ANTHROPIC_API_KEY is
+#                              set, docker_smoke starts tools/ci/llm_fixture.py
+#                              so model seats exercise real HTTP decisions
+#                              without paid LLM calls
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -65,8 +67,13 @@ prefix="${slug}-smoke-${run_id}"
 network="${prefix}-net"
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/${slug}-smoke.XXXXXX")"
 seats=0
+fixture_pid=""
 
 cleanup() {
+  if [ -n "${fixture_pid}" ]; then
+    kill "${fixture_pid}" >/dev/null 2>&1 || true
+    wait "${fixture_pid}" >/dev/null 2>&1 || true
+  fi
   docker ps -aq --filter "name=${prefix}" | xargs -r docker rm -f >/dev/null 2>&1 || true
   docker network rm "${network}" >/dev/null 2>&1 || true
   rm -rf "${work_dir}"
@@ -191,16 +198,47 @@ chmod 777 "${work_dir}"
 docker network create "${network}" >/dev/null
 
 game_env=()
-if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+game_extra_docker=()
+used_fixture=0
+if [ -n "${COWORLD_LLM_ENDPOINT:-}" ]; then
+  game_env+=(-e "COWORLD_LLM_ENDPOINT=${COWORLD_LLM_ENDPOINT}")
+  if [ -n "${COWORLD_LLM_MODEL:-}" ]; then
+    game_env+=(-e "COWORLD_LLM_MODEL=${COWORLD_LLM_MODEL}")
+  fi
+  echo "COWORLD_LLM_ENDPOINT present: forwarding to game container"
+elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
   game_env+=(-e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}")
   echo "ANTHROPIC_API_KEY present: the LLM path will be exercised"
 else
-  echo "no ANTHROPIC_API_KEY: the game must complete on its scripted baselines"
+  used_fixture=1
+  python3 "${script_dir}/llm_fixture.py" \
+    --host 0.0.0.0 --port 0 \
+    --port-file "${work_dir}/fixture.port" \
+    --log-file "${work_dir}/fixture.jsonl" \
+    >"${work_dir}/fixture.log" 2>&1 &
+  fixture_pid=$!
+  for _ in $(seq 1 50); do
+    if [ -s "${work_dir}/fixture.port" ]; then break; fi
+    sleep 0.1
+  done
+  test -s "${work_dir}/fixture.port" || {
+    echo "FAIL: local deterministic LLM fixture did not start" >&2
+    cat "${work_dir}/fixture.log" >&2 || true
+    exit 1
+  }
+  fixture_port="$(cat "${work_dir}/fixture.port")"
+  game_extra_docker+=(--add-host=host.docker.internal:host-gateway)
+  game_env+=(
+    -e "COWORLD_LLM_ENDPOINT=http://host.docker.internal:${fixture_port}"
+    -e "COWORLD_LLM_MODEL=cogmud-ci-fixture"
+  )
+  echo "started local deterministic LLM fixture on port ${fixture_port}"
 fi
 
 echo "starting game container (${image} ${game_bin}) ..."
 docker run -d --name "${prefix}-game" \
   --network "${network}" --network-alias "${prefix}-game" \
+  ${game_extra_docker[@]+"${game_extra_docker[@]}"} \
   -e COGAME_HOST=0.0.0.0 \
   -e COGAME_PORT="${port}" \
   -e COGAME_CONFIG_URI=file:///coworld/config.json \
@@ -270,7 +308,7 @@ echo "all ${seats} player containers exited 0"
 # --------------------------------------------------------------------------
 # Assert the artifacts.
 # --------------------------------------------------------------------------
-if ! python3 - "${work_dir}" "${seats}" "${require_replay_json}" <<'PY'
+if ! python3 - "${work_dir}" "${seats}" "${require_replay_json}" "${used_fixture}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -278,6 +316,7 @@ from pathlib import Path
 work = Path(sys.argv[1])
 seats = int(sys.argv[2])
 require_replay_json = sys.argv[3] not in ("0", "", "false", "no")
+used_fixture = sys.argv[4] == "1"
 
 failure = work / "player_failure.json"
 if failure.exists():
@@ -310,12 +349,27 @@ if not replay_path.exists() or replay_path.stat().st_size == 0:
     raise SystemExit("replay missing or empty (COGAME_SAVE_REPLAY_URI was file:///coworld/replay.json)")
 if require_replay_json:
     try:
-        json.loads(replay_path.read_bytes().decode("utf-8"))
+        replay = json.loads(replay_path.read_bytes().decode("utf-8"))
     except Exception as exc:
         raise SystemExit(
             f"replay is not valid UTF-8 JSON: {exc} "
             "(set SMOKE_REQUIRE_REPLAY_JSON=0 for a binary replay format)"
         ) from exc
+    if used_fixture:
+        fixture_log = work / "fixture.jsonl"
+        if not fixture_log.exists():
+            raise SystemExit("local LLM fixture recorded zero HTTP calls")
+        calls = [json.loads(line) for line in fixture_log.read_text().splitlines() if line.strip()]
+        called_slots = {c["slot"] for c in calls}
+        if called_slots != {0}:
+            raise SystemExit(f"expected HTTP calls only for model slot 0, got {called_slots}")
+        act_events = [e for e in replay.get("events", []) if e.get("kind") == "act"]
+        slot0_acts = [e for e in act_events if e.get("seat") == 0]
+        if not slot0_acts or any(e.get("scripted") for e in slot0_acts):
+            raise SystemExit("model slot 0 did not apply non-scripted HTTP actions")
+        baseline_acts = [e for e in act_events if e.get("seat") != 0]
+        if not baseline_acts or not all(e.get("scripted") for e in baseline_acts):
+            raise SystemExit("baseline slots 1..5 were not recorded as scripted")
 
 print(
     f"smoke OK: seats={seats} results={results_path.stat().st_size}B "

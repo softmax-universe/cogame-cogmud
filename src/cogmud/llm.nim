@@ -4,24 +4,23 @@
 ## happened there last turn, the open offers, the town map) plus that seat's
 ## prompt, and asks Claude for ONE SENTENCE of plain English.
 ##
-## Decisions inside a turn are simultaneous by rule, so all six requests go out
-## as ONE parallel batch (curly.makeRequests); replies that are not a JSON
-## object with an `action` are retried once as a smaller batch with a hint, and
-## anything still failing falls back to the scripted baseline. A sentence that
-## IS well-formed JSON but whose prose the grammar cannot read is NOT a failure
-## — it resolves as a legal no-op with a recorded reason the seat is told next
-## turn, and retrying it would burn the budget teaching a grammar the next
-## observation teaches for free.
+## Decisions inside a turn are simultaneous by rule, so all live model requests
+## go out as ONE parallel batch (curly.makeRequests); replies that are not a
+## JSON object with an `action` are retried once as a smaller batch with a hint,
+## and anything still failing raises ModelDecisionError (no implicit scripted
+## fallback). A sentence that IS well-formed JSON but whose prose the grammar
+## cannot read is NOT a failure — it resolves as a legal no-op with a recorded
+## reason the seat is told next turn, and retrying it would burn the budget
+## teaching a grammar the next observation teaches for free.
 ##
 ## Credentials, in order of preference:
 ##   COWORLD_LLM_ENDPOINT            - hosted sidecar
 ##   Bedrock bearer token            - local play
 ##   ANTHROPIC_API_KEY                - the key itself
 ##   ANTHROPIC_API_KEY_URI            - a URI holding the key
-## With no credentials every decision falls back to the always-legal scripted
-## baseline immediately (no retries, no network waits, no rate floor) so
-## offline certification still completes — this fallback is load-bearing. The
-## same scripted bots are also fieldable policies.
+## Explicitly scripted baseline seats (PLAYER_SCRIPTED=factor or magpie) run
+## deterministically without LLM credentials. Model seats require credentials
+## and fail explicitly if none are configured.
 
 import
   std/[json, options, os, strutils, times, unicode],
@@ -80,6 +79,10 @@ type
   LlmTransport = enum
     ltNone, ltSidecar, ltBedrock, ltAnthropic
 
+  ModelDecisionError* = object of CogmudError
+    seat*: int
+    rawResponse*: string
+
   LlmClient* = ref object
     curl: Curly
     transport: LlmTransport
@@ -94,11 +97,6 @@ type
     maxOutputTokens: int
     timeoutSeconds: int
     disabled*: bool
-    fellBack*: array[Seats, bool]
-      ## Seats whose LLM decision failed twice on the LAST batch and were
-      ## played by the scripted baseline instead. The server stamps this onto
-      ## the act event's `scripted` flag, so a fallback is visible in the
-      ## replay and the results, not only in the stdout log.
     nativeAttempts*: seq[seq[DecisionAttempt]]
 
 const TunedParams* = BaselineParams(
@@ -110,12 +108,14 @@ const TunedParams* = BaselineParams(
   magpieBuyMargin: -1)
 
 proc parseScriptKind*(text: string): ScriptKind =
-  ## PLAYER_SCRIPTED values: "factor"/"1"/"true"/"yes" play the competent
-  ## quest-and-trade baseline, "magpie"/"thief" the thief-peddler.
+  ## Canonical PLAYER_SCRIPTED values: "" or "none" for LLM-driven seats,
+  ## "factor" for the quest-and-trade baseline, "magpie" for the thief-peddler.
   case text.strip().toLowerAscii()
-  of "1", "true", "yes", "factor": skFactor
-  of "magpie", "thief": skMagpie
-  else: skNone
+  of "", "none": skNone
+  of "factor": skFactor
+  of "magpie": skMagpie
+  else:
+    raise newException(CogmudError, "unknown scripted baseline: " & text.strip())
 
 proc resolveApiKey(): string =
   result = getEnv("ANTHROPIC_API_KEY").strip()
@@ -203,7 +203,7 @@ proc newLlmClient*(config: GameConfig): LlmClient =
   else:
     result.transport = ltNone
     result.disabled = true
-    echo "cogmud llm: no LLM credentials; using scripted fallback"
+    echo "cogmud llm: no LLM credentials; model seats unavailable (scripted baselines only)"
 
 # ---- Scripted baselines -----------------------------------------------------
 
@@ -577,22 +577,43 @@ proc userPrompt*(sim: Sim, seat: int, prompt: string): string =
     " characters" &
     (if sim.config.speech: "; say at most " & $MaxSayLen & " characters"
      else: "") &
-    "; notes at most " & $MaxNotesLen & " characters.")
+    "; notes at most " & $MaxNotesLen & " characters. Example: " &
+    (if sim.config.speech:
+       """{"action": "I walk down to the Docks.", "say": "", "notes": ""}"""
+     else:
+       """{"action": "I walk down to the Docks.", "notes": ""}"""))
 
 # ---- Anthropic / Bedrock transport ------------------------------------------
 
+proc stripMarkdownJsonFence(text: string): string =
+  result = text.strip()
+  if result.startsWith("```"):
+    let nl = result.find('\n')
+    if nl < 0:
+      return result
+    let header = result[3 ..< nl].strip().toLowerAscii()
+    if header.len > 0 and header != "json":
+      return result
+    let rest = result[nl + 1 .. ^1]
+    if rest.endsWith("```"):
+      result = rest[0 ..< rest.len - 3].strip()
+
 proc extractJsonObject*(text: string): JsonNode =
-  ## Pulls the first {...} object out of a model response, tolerating fences
-  ## and trailing prose.
-  let start = text.find('{')
-  let stop = text.rfind('}')
-  if start < 0 or stop <= start:
+  ## Parses a JSON object from a model response, accepting either raw JSON
+  ## or a single standard outer Markdown JSON fence.
+  let candidate = stripMarkdownJsonFence(text)
+  if not candidate.startsWith("{") or not candidate.endsWith("}"):
     var head = text.strip()
     if head.len > 160:
       head = head[0 ..< 160] & "..."
     raise newException(CogmudError, "no JSON object in response: " &
       head.replace("\n", " "))
-  parseJson(text[start .. stop])
+  try:
+    result = parseJson(candidate)
+  except CatchableError as error:
+    raise newException(CogmudError, "invalid JSON in response: " & error.msg)
+  if result.kind != JObject:
+    raise newException(CogmudError, "reply is not a JSON object")
 
 proc requestFor(client: LlmClient, system, user: string, slot: int):
     tuple[url: string, headers: HttpHeaders, body: string] =
@@ -666,9 +687,10 @@ proc cleanText*(text: string, limit: int): string =
   result = result.runeSubStr(0, limit - 1) & "\u2026"
 
 proc parseDecision*(payload: JsonNode): Decision =
-  ## "Invalid" means: not a JSON object, or `action` missing, not a string, or
-  ## empty after stripping. An unreadable-but-present action is VALID — it is a
-  ## legal no-op the town explains back to the seat, never a retry.
+  ## "Invalid" means: not a JSON object, `action` missing/not a string/empty,
+  ## or optional `say`/`notes` present with a non-string value. An
+  ## unreadable-but-present action is VALID — it is a legal no-op the town
+  ## explains back to the seat, never a retry.
   if payload.isNil or payload.kind != JObject:
     raise newException(CogmudError, "reply is not a JSON object")
   let node = payload{"action"}
@@ -678,8 +700,16 @@ proc parseDecision*(payload: JsonNode): Decision =
   if action.len == 0:
     raise newException(CogmudError, "action is empty")
   result.sentence = action
-  result.say = cleanText(payload{"say"}.getStr(), MaxSayLen)
-  result.notes = cleanText(payload{"notes"}.getStr(), MaxNotesLen)
+  let sayNode = payload{"say"}
+  if not sayNode.isNil and sayNode.kind != JNull:
+    if sayNode.kind != JString:
+      raise newException(CogmudError, "say must be a string")
+    result.say = cleanText(sayNode.getStr(), MaxSayLen)
+  let notesNode = payload{"notes"}
+  if not notesNode.isNil and notesNode.kind != JNull:
+    if notesNode.kind != JString:
+      raise newException(CogmudError, "notes must be a string")
+    result.notes = cleanText(notesNode.getStr(), MaxNotesLen)
 
 proc decisionReply*(decision: Decision): JsonNode =
   %*{"action": decision.sentence, "say": decision.say, "notes": decision.notes}
@@ -696,22 +726,27 @@ proc decideAll*(
   prompts: seq[string],
   scripted: seq[ScriptKind]
 ): seq[Decision] =
-  ## One decision per seat in `seats`, in order. Never raises: any failure
-  ## falls back to the scripted baseline so the episode always advances.
-  ## `prompts` and `scripted` are indexed by SEAT. All the live seats' requests
-  ## go out as ONE parallel batch, because their decisions are simultaneous by
-  ## rule — a default episode is 14 batched round trips, not 84.
+  ## One decision per seat in `seats`, in order. Explicitly scripted baseline
+  ## seats run deterministically; model seats invoke the configured LLM
+  ## transport in one parallel batch and retry once on invalid replies. Any
+  ## unrecovered model failure raises ModelDecisionError with raw response data
+  ## preserved — never substituting a scripted or no-op action.
   result = newSeq[Decision](seats.len)
   let capture = getEnv(CogameSaveTrajectoryUriEnv).len > 0
   if capture: client.nativeAttempts = newSeq[seq[DecisionAttempt]](Seats)
-  for seat in 0 ..< Seats:
-    client.fellBack[seat] = false
+  var lastError: array[Seats, string]
+  var lastRaw: array[Seats, string]
   var open: seq[int]
   for index, seat in seats:
     let kind = scripted[seat]
-    if kind != skNone or client.disabled:
-      result[index] = scriptedAction(sim, seat,
-        (if kind == skNone: skFactor else: kind))
+    if kind != skNone:
+      result[index] = scriptedAction(sim, seat, kind)
+    elif client.disabled:
+      var err = newException(ModelDecisionError,
+        "LLM transport unavailable (no credentials or auth failed) for model seat " & $seat)
+      err.seat = seat
+      err.rawResponse = ""
+      raise err
     else:
       open.add(index)
   for attempt in 0 .. 1:
@@ -743,6 +778,7 @@ proc decideAll*(
       let seat = seats[index]
       var evidence: DecisionAttempt
       if capture: evidence = pendingEvidence[position]
+      lastRaw[seat] = responses[position].response.body
       try:
         if capture:
           evidence.receiveNativeResponse(responses[position].response,
@@ -760,14 +796,20 @@ proc decideAll*(
           if not evidence.accepted:
             evidence.rejectionReason = some("native parser normalized the proposal")
       except CatchableError as error:
+        lastError[seat] = error.msg
         if capture: evidence.rejectionReason = some(error.msg)
         echo "cogmud llm: seat ", seat, " attempt ", attempt, " failed: ",
           error.msg
         stillOpen.add(index)
       if capture: client.nativeAttempts[seat].add(evidence)
     open = stillOpen
-  for index in open:
-    let seat = seats[index]
-    echo "cogmud llm: seat ", seat, " falling back to scripted decision"
-    client.fellBack[seat] = true
-    result[index] = scriptedAction(sim, seat, skFactor)
+  if open.len > 0:
+    let seat = seats[open[0]]
+    let msg =
+      if lastError[seat].len > 0: lastError[seat]
+      else: "LLM transport disabled before seat " & $seat & " could decide"
+    var err = newException(ModelDecisionError,
+      "seat " & $seat & " failed to produce a valid model decision: " & msg)
+    err.seat = seat
+    err.rawResponse = lastRaw[seat]
+    raise err
