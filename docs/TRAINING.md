@@ -3,9 +3,10 @@
 ## Authentic hosted model traces
 
 The ordinary game server can write a private JSONL decision artifact when
-`COGAME_SAVE_TRAJECTORY_URI` is set. Capture preserves the six-seat parallel
-requests, native retry and explicit failure behavior, 12-second batch floor,
-and all fourteen turns. Each request retains the exact prompt, decoder settings,
+`COGAME_SAVE_TRAJECTORY_URI` is set. Capture preserves one request per active model seat per turn, sent in parallel,
+with the usual 12-second spacing between batches. The prompt and canonical
+training completions use bare JSON. A single plain or json Markdown fence is
+also accepted. Prose outside the decision object is a player error. Each request retains the exact prompt, decoder settings,
 received response, platform call ID, and available usage/identity fields.
 Missing usage is unknown.
 
@@ -14,7 +15,7 @@ submission resolves the town, each actual act event is joined by seat to its
 original observation and attempts, in the engine's class/initiative order.
 Only unchanged model replies can be selected; optional omitted say/notes fields
 use their native empty defaults for equality only. Parser or engine normalization
-excludes selection without changing the stored response. Unrecovered model
+excludes selection without changing the stored response. Model
 failures end the episode explicitly with `status: "failed"`, preserving raw
 attempts without substituting a scripted action. Authenticate platform receipts
 with the maintained research collector before training.
@@ -32,11 +33,10 @@ game and player, then run:
 python3 tools/test_native_capture.py bin/cogmud bin/cogmud-player /path/to/retained-evidence
 ```
 
-The destination must be new. This retains six complete standard/honest-town
-games with capture on/off replay and outcome parity, resolution-order joins,
-retries, fallback, normalization, privacy, legal no-ops, missing usage, and
-credential-free fallback. The provider is synthetic system-test evidence;
-real-model receipt admission and Qwen learning require separate measurements.
+The destination must be new. The fixture checks six completed games for
+capture parity and three failed games for decision rejection, HTTP failure,
+and missing credentials. Failed games retain raw attempts in the private
+trajectory and leave participant outcomes empty.
 Scenario families group the actual seeded world across variants and wording.
 
 

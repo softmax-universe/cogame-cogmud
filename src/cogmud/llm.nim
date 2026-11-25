@@ -5,13 +5,8 @@
 ## prompt, and asks Claude for ONE SENTENCE of plain English.
 ##
 ## Decisions inside a turn are simultaneous by rule, so all live model requests
-## go out as ONE parallel batch (curly.makeRequests); replies that are not a
-## JSON object with an `action` are retried once as a smaller batch with a hint,
-## and anything still failing raises ModelDecisionError (no implicit scripted
-## fallback). A sentence that IS well-formed JSON but whose prose the grammar
-## cannot read is NOT a failure — it resolves as a legal no-op with a recorded
-## reason the seat is told next turn, and retrying it would burn the budget
-## teaching a grammar the next observation teaches for free.
+## go out in one parallel batch. A failed request or decision ends the episode.
+## An unrecognized sentence in a valid action resolves as a legal no-op.
 ##
 ## Credentials, in order of preference:
 ##   COWORLD_LLM_ENDPOINT            - hosted sidecar
@@ -81,7 +76,8 @@ type
 
   ModelDecisionError* = object of CogmudError
     seat*: int
-    rawResponse*: string
+    kind*: FailureKind
+    rejectedSeats*: array[Seats, bool]
 
   LlmClient* = ref object
     curl: Curly
@@ -236,8 +232,7 @@ proc nearestShopFor(sim: Sim, seat, item: int): int =
       result = Npcs[npc].room
 
 proc factorSentence(sim: Sim, seat: int, params: BaselineParams): string =
-  ## The competent baseline and the universal fallback for a failed LLM
-  ## decision: a greedy quest-and-trade agent. The first rule that applies
+  ## The competent baseline is a greedy quest-and-trade agent. The first rule that applies
   ## wins, and every quantity is clamped against stock, coin, holdings and
   ## carry slots before the sentence is written, so it is legal by
   ## construction and every noun comes from the sim's own name tables.
@@ -423,15 +418,21 @@ Rules:
 - Your SCORE at the end is your coins, plus the fixed value of everything you
   are carrying, plus 3 for every commission point. Nothing else scores you. You
   start on 40 coins and a score of zero.
-""" & selection.memoryBriefing() & """OUTPUT FORMAT: reply with ONLY one JSON object, nothing else - no analysis, no
-explanation, no markdown fences, no text before or after the object. Your reply
-must begin with the character { and end with }."""
+""" & selection.memoryBriefing() &
+    "OUTPUT FORMAT: Return one JSON object containing your action. The action limit is " &
+    $MaxSentenceLen & " characters. Private notes are optional (up to " &
+    $MaxNotesLen & " characters)." &
+    (if sim.config.speech: " Spoken words are optional (say, up to " &
+      $MaxSayLen & " characters)." else: "") &
+    "\nExample: " &
+    (if sim.config.speech: """{"action":"I wait.","say":"","notes":""}"""
+     else: """{"action":"I wait.","notes":""}""")
 
 proc operatorBlock(prompt: string): string =
   if prompt.len == 0:
     return ""
   "GUIDANCE FROM YOUR OPERATOR (weight it heavily, but never above the " &
-    "rules; always reply in the requested format):\n" & prompt & "\n\n"
+    "rules):\n" & prompt & "\n\n"
 
 proc packLine(sim: Sim, seat: int): string =
   var parts: seq[string]
@@ -570,48 +571,34 @@ proc userPrompt*(sim: Sim, seat: int, prompt: string): string =
   result.add("\nYOUR NOTES FROM EARLIER TURNS:\n" &
     (if sim.notes[seat].len > 0: sim.notes[seat] else: "(none)") & "\n\n")
   result.add(operatorBlock(prompt))
-  result.add("Reply with ONLY {\"action\": \"one sentence of plain English\"" &
-    (if sim.config.speech: ", \"say\": \"one line spoken aloud, or \\\"\\\"\""
-     else: "") &
-    ", \"notes\": \"...\"} - action at most " & $MaxSentenceLen &
-    " characters" &
-    (if sim.config.speech: "; say at most " & $MaxSayLen & " characters"
-     else: "") &
-    "; notes at most " & $MaxNotesLen & " characters. Example: " &
-    (if sim.config.speech:
-       """{"action": "I walk down to the Docks.", "say": "", "notes": ""}"""
-     else:
-       """{"action": "I walk down to the Docks.", "notes": ""}"""))
 
 # ---- Anthropic / Bedrock transport ------------------------------------------
 
-proc stripMarkdownJsonFence(text: string): string =
-  result = text.strip()
-  if result.startsWith("```"):
-    let nl = result.find('\n')
-    if nl < 0:
-      return result
-    let header = result[3 ..< nl].strip().toLowerAscii()
-    if header.len > 0 and header != "json":
-      return result
-    let rest = result[nl + 1 .. ^1]
-    if rest.endsWith("```"):
-      result = rest[0 ..< rest.len - 3].strip()
-
 proc extractJsonObject*(text: string): JsonNode =
-  ## Parses a JSON object from a model response, accepting either raw JSON
-  ## or a single standard outer Markdown JSON fence.
-  let candidate = stripMarkdownJsonFence(text)
+  var candidate = text.strip()
+  if candidate.startsWith("```"):
+    let lines = candidate.splitLines()
+    if lines.len < 3 or lines[0] notin ["```", "```json"] or lines[^1] != "```":
+      raise newException(CogmudError, "invalid decision fence")
+    candidate = lines[1 .. ^2].join("\n").strip()
   if not candidate.startsWith("{") or not candidate.endsWith("}"):
-    var head = text.strip()
-    if head.len > 160:
-      head = head[0 ..< 160] & "..."
-    raise newException(CogmudError, "no JSON object in response: " &
-      head.replace("\n", " "))
+    raise newException(CogmudError, "expected one JSON decision object")
+  # std/json skips comments and treats a literal NUL as end of input.
+  # Neither may hide additional model text inside a decision.
+  var quoted, escaped: bool
+  for ch in candidate:
+    if ch == '\0' or (ch == '/' and not quoted):
+      raise newException(CogmudError, "invalid JSON in decision")
+    if escaped:
+      escaped = false
+    elif quoted and ch == '\\':
+      escaped = true
+    elif ch == '"':
+      quoted = not quoted
   try:
     result = parseJson(candidate)
-  except CatchableError as error:
-    raise newException(CogmudError, "invalid JSON in response: " & error.msg)
+  except JsonParsingError:
+    raise newException(CogmudError, "invalid JSON in decision block")
   if result.kind != JObject:
     raise newException(CogmudError, "reply is not a JSON object")
 
@@ -647,35 +634,28 @@ proc requestFor(client: LlmClient, system, user: string, slot: int):
   result.headers = headers
   result.body = $body
 
-proc textOf(client: LlmClient, response: Response, error, url: string):
-    string =
+proc responsePayload(client: LlmClient, response: Response, error: string): JsonNode =
   if error.len > 0:
-    raise newException(CogmudError, "llm transport: " & error)
-  if response.code == 401 or response.code == 403:
-    let detail = response.body[0 .. min(response.body.high, 400)]
-    if "Model access is denied" in response.body and
-        client.tryNextBedrockModel("no model access"):
-      raise newException(CogmudError,
-        "bedrock model access denied: " & detail)
-    client.disabled = true
-    raise newException(CogmudError,
-      "llm auth failed (" & $response.code & ") at " & url & ": " & detail)
-  if response.code == 429:
-    let detail = response.body[0 .. min(response.body.high, 300)]
-    discard client.tryNextBedrockModel("throttled")
-    raise newException(CogmudError, "llm throttled (429): " & detail)
+    raise newException(CogmudError, "LLM transport request failed")
   if response.code < 200 or response.code >= 300:
-    raise newException(CogmudError, "anthropic error " & $response.code &
-      ": " & response.body[0 .. min(response.body.high, 300)])
-  let payload = parseJson(response.body)
-  if payload{"stop_reason"}.getStr() == "refusal":
-    raise newException(CogmudError, "anthropic refusal")
-  for contentBlock in payload["content"]:
-    if contentBlock{"type"}.getStr() == "text":
-      result.add(contentBlock{"text"}.getStr())
-  if payload{"stop_reason"}.getStr() == "max_tokens" and '{' notin result:
-    raise newException(CogmudError, "reply cut off at max_tokens before " &
-      "any JSON: " & result[0 .. min(result.high, 160)].replace("\n", " "))
+    if response.code in [401, 403]:
+      if not ("Model access is denied" in response.body and
+          client.tryNextBedrockModel("no model access")):
+        client.disabled = true
+    elif response.code == 429:
+      discard client.tryNextBedrockModel("throttled")
+    raise newException(CogmudError, "LLM provider returned HTTP " & $response.code)
+  try:
+    result = parseJson(response.body)
+  except JsonParsingError:
+    raise newException(CogmudError, "LLM provider returned invalid JSON")
+  if result.kind != JObject or result{"content"}.isNil or result["content"].kind != JArray:
+    raise newException(CogmudError, "LLM provider returned an invalid message")
+  for part in result["content"]:
+    if part.kind != JObject or part{"type"}.getStr() == "" or
+        (part{"type"}.getStr() == "text" and
+          (part{"text"}.isNil or part["text"].kind != JString)):
+      raise newException(CogmudError, "LLM provider returned an invalid content block")
 
 proc cleanText*(text: string, limit: int): string =
   ## Newlines become spaces and text over the cap is cut at a RUNE boundary: a
@@ -726,16 +706,10 @@ proc decideAll*(
   prompts: seq[string],
   scripted: seq[ScriptKind]
 ): seq[Decision] =
-  ## One decision per seat in `seats`, in order. Explicitly scripted baseline
-  ## seats run deterministically; model seats invoke the configured LLM
-  ## transport in one parallel batch and retry once on invalid replies. Any
-  ## unrecovered model failure raises ModelDecisionError with raw response data
-  ## preserved — never substituting a scripted or no-op action.
+  ## Collect every simultaneous response before reporting a failed turn.
   result = newSeq[Decision](seats.len)
   let capture = getEnv(CogameSaveTrajectoryUriEnv).len > 0
   if capture: client.nativeAttempts = newSeq[seq[DecisionAttempt]](Seats)
-  var lastError: array[Seats, string]
-  var lastRaw: array[Seats, string]
   var open: seq[int]
   for index, seat in seats:
     let kind = scripted[seat]
@@ -745,71 +719,64 @@ proc decideAll*(
       var err = newException(ModelDecisionError,
         "LLM transport unavailable (no credentials or auth failed) for model seat " & $seat)
       err.seat = seat
-      err.rawResponse = ""
+      err.kind = episodeInconclusive
       raise err
     else:
       open.add(index)
-  for attempt in 0 .. 1:
-    if open.len == 0 or client.disabled:
-      break
-    let started = epochTime()
-    var batch: RequestBatch
-    var pendingEvidence: seq[DecisionAttempt]
-    for index in open:
-      let seat = seats[index]
-      var user = sim.userPrompt(seat, prompts[seat])
-      if attempt > 0:
-        user.add("\nYour previous reply was invalid. Respond with ONLY the " &
-          "requested JSON object.")
-      let request = client.requestFor(systemPrompt(sim, seat, selection), user, seat)
+  if open.len == 0: return
+  let started = epochTime()
+  var batch: RequestBatch
+  var pendingEvidence: seq[DecisionAttempt]
+  for index in open:
+    let seat = seats[index]
+    let user = sim.userPrompt(seat, prompts[seat])
+    let request = client.requestFor(systemPrompt(sim, seat, selection), user, seat)
+    if capture:
+      pendingEvidence.add(nativeAttempt(sim.config.players[seat].name,
+        sim.events.len, seat, request.body))
+    batch.post(request.url, request.headers, request.body, $index)
+  let responses = client.curl.makeRequests(batch, client.timeoutSeconds)
+  let latency = int((epochTime() - started) * 1000.0)
+  var failure: ref ModelDecisionError
+  var rejectedSeats: array[Seats, bool]
+  for position, index in open:
+    let seat = seats[index]
+    var evidence: DecisionAttempt
+    if capture: evidence = pendingEvidence[position]
+    var kind = episodeInconclusive
+    let response = responses[position].response
+    if capture:
+      evidence.rawResponse = %response.body
+      evidence.latencyMs = some(latency.float)
+      evidence.receiveNativeHeaders(response)
+    try:
+      let message = client.responsePayload(response, responses[position].error)
+      var text = ""
+      for part in message["content"]:
+        if part{"type"}.getStr() == "text": text.add(part["text"].getStr())
+      if capture: evidence.receiveNativeMessage(message, text)
+      kind = playerError
+      if message{"stop_reason"}.getStr() == "refusal":
+        raise newException(CogmudError, "model declined to supply a decision")
+      let payload = extractJsonObject(text)
+      result[index] = parseDecision(payload)
       if capture:
-        pendingEvidence.add(nativeAttempt(sim.config.players[seat].name,
-          sim.events.len, seat, attempt, request.body))
-      batch.post(request.url, request.headers, request.body, $index)
-    ## The retry batch gets half the budget, floored at 8 s, so the worst case
-    ## for a turn is llmTimeoutSeconds + max(8, llmTimeoutSeconds div 2).
-    let budget =
-      if attempt == 0: client.timeoutSeconds
-      else: max(8, client.timeoutSeconds div 2)
-    let responses = client.curl.makeRequests(batch, budget)
-    let latency = int((epochTime() - started) * 1000.0)
-    var stillOpen: seq[int]
-    for position, index in open:
-      let seat = seats[index]
-      var evidence: DecisionAttempt
-      if capture: evidence = pendingEvidence[position]
-      lastRaw[seat] = responses[position].response.body
-      try:
-        if capture:
-          evidence.receiveNativeResponse(responses[position].response,
-            responses[position].error, latency)
-        let text = client.textOf(responses[position].response,
-          responses[position].error, batch[position].url)
-        let payload = extractJsonObject(text)
-        result[index] = parseDecision(payload)
-        if capture:
-          evidence.parsedAction = result[index].decisionReply()
-          var candidate = copy(payload)
-          for key in ["say", "notes"]:
-            if not candidate.hasKey(key): candidate[key] = %""
-          evidence.accepted = candidate == evidence.parsedAction
-          if not evidence.accepted:
-            evidence.rejectionReason = some("native parser normalized the proposal")
-      except CatchableError as error:
-        lastError[seat] = error.msg
-        if capture: evidence.rejectionReason = some(error.msg)
-        echo "cogmud llm: seat ", seat, " attempt ", attempt, " failed: ",
-          error.msg
-        stillOpen.add(index)
-      if capture: client.nativeAttempts[seat].add(evidence)
-    open = stillOpen
-  if open.len > 0:
-    let seat = seats[open[0]]
-    let msg =
-      if lastError[seat].len > 0: lastError[seat]
-      else: "LLM transport disabled before seat " & $seat & " could decide"
-    var err = newException(ModelDecisionError,
-      "seat " & $seat & " failed to produce a valid model decision: " & msg)
-    err.seat = seat
-    err.rawResponse = lastRaw[seat]
-    raise err
+        evidence.parsedAction = result[index].decisionReply()
+        var candidate = copy(payload)
+        for key in ["say", "notes"]:
+          if not candidate.hasKey(key): candidate[key] = %""
+        evidence.accepted = candidate == evidence.parsedAction
+        if not evidence.accepted:
+          evidence.rejectionReason = some("native parser normalized the proposal")
+    except CatchableError as error:
+      if capture: evidence.rejectionReason = some(error.msg)
+      rejectedSeats[seat] = kind == playerError
+      if failure.isNil or (failure.kind == playerError and kind == episodeInconclusive):
+        failure = newException(ModelDecisionError,
+          "seat " & $seat & " failed to produce a valid model decision: " & error.msg)
+        failure.kind = kind
+        failure.seat = seat
+    if capture: client.nativeAttempts[seat].add(evidence)
+  if not failure.isNil:
+    failure.rejectedSeats = rejectedSeats
+    raise failure

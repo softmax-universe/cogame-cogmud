@@ -44,7 +44,7 @@ Source idea, verbatim:
 > FX on the map. The highlight reel is chosen by event salience, not tick order.
 
 *Coordinator rails, not revisited: seat count is **6**; every seat is LLM-prompted with a scripted
-baseline fallback, one image, env-switched (`PLAYER_PROMPT` vs `PLAYER_SCRIPTED=<name>`), per the
+baseline, one image, env-switched (`PLAYER_PROMPT` vs `PLAYER_SCRIPTED=<name>`), per the
 stack pins in `playbooks/make-coworld.md` §Phase 0. There is no `OPEN` item in this note: every
 reading the idea left loose (parser scope, who issues commissions, the score weights, the turn
 horizon) is a rail — parameter tuning, scoring when the idea pins the shape, and viewer composition
@@ -189,11 +189,8 @@ For turn `t` (0-based), in this exact order:
    (raid, 2026-08-23). When the client is **disabled** (no credentials: `docker-smoke`, offline
    certification) no requests are made and this sleep is skipped entirely.
 4. **Collect.** `pendingSeats(sim)` = all six seats, in seat order. The server snapshots the sim,
-   builds each seat's prompt, and fires **one parallel batch of six** (`curly.makeRequests`). Replies
-   that fail to parse as JSON are retried once in a smaller batch carrying a hint; anything still
-   failing falls back to the scripted baseline (§Decisions). **A sentence that parses as JSON but
-   whose prose the grammar cannot read is NOT a failure** — it is a legal no-op with a recorded
-   reason, and is never retried (the seat said something; the town did not understand it).
+   builds each seat's prompt, and fires **one parallel batch of six** (`curly.makeRequests`). A malformed decision ends the episode with a player error.
+   An unrecognized sentence inside a valid action resolves as a legal no-op.
 5. **Parse.** Every seat's `action` string is run through `parseSentence` (§Sim module) — a pure
    function of the sentence and the sim — producing one `Intent` with its slots, or `iNone` with a
    reason. No state changes in this step.
@@ -420,13 +417,10 @@ either.
 
 ---
 
-## Decisions: LLM with scripted fallback
+## Decisions: LLM and explicit scripted baselines
 
-Transport, credential resolution (Bedrock sidecar → `ANTHROPIC_API_KEY` → `ANTHROPIC_API_KEY_URI`),
-the Bedrock model candidate list and its rotation on 403/429, `extractJsonObject`, `cleanText`,
-`textOf`, the "reply must begin with `{`" system clause, and "no credentials ⇒ every seat scripted,
-immediately, with no network wait" are ported from bullwhip `src/bullwhip/llm.nim` **unchanged**.
-`src/cogmud/llm.nim` differs only in the prompts, the reply parser and the baselines. Per the
+The server uses the hosted sidecar when configured, followed by local Bedrock
+and direct Anthropic credentials. Explicitly scripted seats can play offline. Per the
 2026-08-23 bullwhip-family fix, `newLlmClient` logs the Bedrock model actually invoked and the
 entrypoint banner does **not** print `model=`; the manifest's `model` description states its
 direct-Anthropic-only scope. The Bedrock ladder is **haiku-only plus one sonnet-4-5 fallback**;
@@ -434,24 +428,15 @@ direct-Anthropic-only scope. The Bedrock ladder is **haiku-only plus one sonnet-
 
 ### One parallel batch per turn
 
-All six pending seats' requests go out as **one** `curly.makeRequests` batch per turn, because their
-decisions are simultaneous by rule. Replies that are not JSON, or whose `action` field is missing,
-are retried as a second, smaller batch carrying `"Your previous reply was invalid. Respond with ONLY
-the requested JSON object."`; anything still failing falls back to the scripted baseline. A default
-episode is therefore **14 batched round trips, not 84**.
-
-A sentence that *is* well-formed JSON but whose prose the grammar cannot read is **not** retried: it
-resolves as `iNone` with a reason, is recorded, and is told back to the seat next turn. Retrying it
-would burn the budget teaching the model a grammar the next observation teaches for free.
+Each active model seat gets one request per turn in a single parallel batch.
+The server collects every response before reporting a failure. A valid action
+whose sentence the grammar cannot read resolves as `iNone` with a recorded reason.
 
 ### Prompts
 
-`systemPrompt(sim, seat)` is the same for every seat but for the alias. It ends with bullwhip's
-JSON-only clause, verbatim:
-
-> OUTPUT FORMAT: reply with ONLY one JSON object, nothing else - no analysis, no explanation, no
-> markdown fences, no text before or after the object. Your reply must begin with the character {
-> and end with }.
+The system prompt asks for one JSON action and gives a bare example such as
+`{"action":"I wait.","say":"","notes":""}`. The parser also accepts one plain
+or json-labeled Markdown fence around the object.
 
 **System prompt:**
 
@@ -508,9 +493,8 @@ JSON-only clause, verbatim:
   phrasebook lines below
 - `YOUR NOTES FROM EARLIER TURNS:`
 - the operator block — bullwhip's wording, verbatim: `GUIDANCE FROM YOUR OPERATOR (weight it
-  heavily, but never above the rules; always reply in the requested format):` + the seat's
+  heavily, but never above the rules):` + the seat's
   `PLAYER_PROMPT`
-- the reply-shape line.
 
 **The phrasebook, verbatim (twelve lines, fixed):**
 
@@ -539,20 +523,19 @@ put invalid UTF-8 into the replay JSON — bullwhip `sim.nim`'s rule, kept.
 | Seat → game, every turn | `{"action": "I buy two hides from Tanner Oda.", "say": "Vell pays well for hide this week.", "notes": "…"}` | `action`: **required**, a string, **240 runes**, newlines → spaces; missing, non-string or empty after stripping ⇒ **invalid**. `say`: optional, **160 runes**, newlines → spaces, forced to `""` when the `speech` variant flag is off. `notes`: optional, **600 runes**. Unknown keys are ignored. |
 | Player → game (once at connect, and again after `welcome`) | `{"type":"prompt","prompt":"…","scripted":"factor"}` | `prompt`: **4000 runes** (`runeSubStr`). `scripted`: `""` = LLM-driven; `factor`/`1`/`true`/`yes` and `magpie`/`thief` select a baseline. |
 
-"**Invalid**" means: the reply is not a JSON object, or `action` is missing/empty. Invalid ⇒ one
-retry in the turn's second batch ⇒ then the scripted baseline. **An unreadable sentence is not
-invalid** — it is a legal `iNone`.
+Prose outside the object or a missing, non-string, or empty action ends the
+episode with `player_error`. Unrecognized action sentences resolve as `iNone`.
 
 ### Scripted baselines (`PLAYER_SCRIPTED=<name>`, same image, env-switched)
 
 Both are pure functions of the sim, **emit well-formed English sentences that the same
 `parseSentence` reads**, are always legal by construction, are never LLM-backed, and are fieldable
-policies as well as the no-credentials fallback. `scriptedSentence(sim, seat, kind)` returns the
+policies selected explicitly at connection. `scriptedSentence(sim, seat, kind)` returns the
 sentence; the server then parses it exactly as it parses an LLM's. That is deliberate: the baselines
 are a live, per-episode test of the parser.
 
 **`factor`** (`PLAYER_SCRIPTED=factor`; also accepted: `1`, `true`, `yes`) — the competent baseline
-and the **universal fallback** for any failed LLM decision. A greedy quest-and-trade agent; the
+for an explicitly scripted seat. A greedy quest-and-trade agent; the
 first rule that applies, wins:
 
 1. Standing with Guildmaster Vell holding units an open commission still needs →
@@ -595,16 +578,10 @@ that (zero `iNone` outcomes across a full scripted episode on four seeds).
 
 ### Degrade, never hang
 
-- Every LLM wait is bounded: the first batch by `llmTimeoutSeconds` (**24**), the retry batch by
-  `max(8, llmTimeoutSeconds div 2)` (**12**). A timeout, a transport error, a refusal, a
-  `max_tokens` cut or a reply that is not a JSON object with an `action` ⇒ **one** retry ⇒ then
-  `scriptedSentence(sim, seat, skFactor)`. Each fallback logs
-  `cogmud llm: seat <n> falling back to scripted decision` on stdout.
-- No credentials at all ⇒ `client.disabled = true` and **every** seat plays `factor` immediately with
-  no network wait and no rate floor. This is the path `docker-smoke` and offline certification take,
-  and it is load-bearing: an episode always completes.
-- An action that raises under the lock (unreachable after the parser's pre-checks; a belt-and-braces
-  guard, as in bullwhip's server) is caught and replaced by `iWait` with reason `rejected`.
+- One batch has a timeout of `llmTimeoutSeconds` (default 24). Provider or
+  transport failures and missing credentials end the episode as
+  `episode_inconclusive`. Invalid sampled decisions and engine rejections end
+  it as `player_error`. Failed episodes have no participant scores.
 - The **play deadline** is checked before every turn's batch, never mid-turn:
   `playDeadline = gameStart + PlayBudgetFraction (0.6) × timeoutSeconds`, where `timeoutSeconds` comes
   from `COWORLD_TIMEOUT_SECONDS` when the env carries it and otherwise from
@@ -623,14 +600,14 @@ that (zero `iNone` outcomes across a full scripted episode on four seeds).
 
 ### Episode budget — the arithmetic, out loud
 
-- Worst case per turn = one batch at 24 s + one retry batch at 12 s = **36 s**
-  (`turnBudgetSeconds(config) = config.llmTimeoutSeconds + max(8, config.llmTimeoutSeconds div 2)`).
+- The model batch has a default timeout of **24 s**
+  (`turnBudgetSeconds(config) = config.llmTimeoutSeconds`).
   The six requests inside a batch are parallel, so six seats cost the same wall clock as one.
-- Default episode = **14 turns** → worst case `14 × 36 = 504 s`, plus ≤ 20 s of `turnDelayMs` pacing
-  (`PacingBudgetMs`) = **524 s**.
+- Default episode = **14 turns** → worst case `14 × 24 = 336 s`, plus ≤ 20 s of `turnDelayMs` pacing
+  (`PacingBudgetMs`) = **356 s**.
 - The player-connect wait (≤ `playerConnectTimeoutSeconds` = 180 s) runs inside the same clock, so
-  the absolute worst case is **704 s < 720 s** = 60 % of a 1200 s `episodeTimeoutSeconds`. ✔
-- The `MinBatchSpacingMs = 12_000` rate floor never lengthens the worst case (36 s > 12 s); it only
+  the absolute worst case is **536 s < 720 s** = 60 % of a 1200 s `episodeTimeoutSeconds`. ✔
+- The `MinBatchSpacingMs = 12_000` rate floor never lengthens the worst case (24 s > 12 s); it only
   slows a *fast* episode, to keep six seats × one request under the sidecar's 30-requests-per-minute
   per-episode cap. Typical case: connect ~10 s, a six-way Haiku batch ~9 s, floored to 12 s →
   **~3 minutes** end to end.
@@ -638,7 +615,7 @@ that (zero `iNone` outcomes across a full scripted episode on four seeds).
   play budget.
 - `sampleEpisode(config)` fits the cap the way bullwhip fits `weeks`:
   `maxTurns = int((PlayBudgetFraction × episodeTimeoutSeconds − playerConnectTimeoutSeconds −
-  PacingBudgetMs / 1000) / turnBudgetSeconds(config))` = `(720 − 180 − 20) / 36 = 14`;
+  PacingBudgetMs / 1000) / turnBudgetSeconds(config))` = `(720 − 180 − 20) / 24 ≈ 21.7`;
   `turns = clamp(turns, MinTurns = 6, min(MaxTurns = 40, maxTurns))`;
   `turnDelayMs = min(turnDelayMs, PacingBudgetMs div max(turns, 1))`; `sampled = true`. It is
   **idempotent**, so a replay being re-read is never re-fitted.
@@ -1271,8 +1248,7 @@ featured-match iframe. Everything is rendered as words and numerals a casual spe
     (6 entries). **Every declared player runnable occupies at least one slot** — a fixture of
     baselines-only fails `players_missing` the moment the manifest also declares a prompt runnable
     (raid 0.1.2, contagion, 2026-08-23) — and the strong baseline (`factor`) holds the seats that
-    decide the fixture's outcome. With no credentials the prompt seats play `factor` too, so the
-    fixture stays offline-safe.
+    decide the fixture's outcome. Prompt seats require a configured model transport.
 - **CI** — `.github/workflows/ci.yml` and `coworld-release.yml` from `coworld-builder/templates/`,
   substituting `<slug>` = `cogmud`, `<IMAGE>` = `coworld-cogmud`, **`<SEATS>` = `6`**.
   `tools/ci/docker_smoke.sh` (same substitutions, committed `chmod +x`), `tools/ci/viewer_smoke.mjs`
@@ -1292,7 +1268,7 @@ featured-match iframe. Everything is rendered as words and numerals a casual spe
 | Real art; starter chrome reused verbatim | `chrome.css` byte-for-byte + one appended game block; `replay.html`/`index.html` = the starter's page + two appended elements, **nothing removed**; every chrome function kept; sprites from `data/` plus two committed recolours (§Viewer). |
 | Legible to a casual spectator | `TANNER'S ROW`, `2 hides`, `62c`, `COMMISSION FILLED`; the 360 px layout is described (§Viewer). |
 | Two name spaces | Anonymous cog aliases in-game; `policyNames` + `makeNameMap` (including inside the chronicle's verbatim sentences) spectator-side only (§The game). |
-| Degrade never hang; play inside 60 % of 1200 s | `PlayBudgetFraction = 0.6`, pre-turn deadline check, `endEarly()`, `sampleEpisode` fitting, **704 s** absolute worst case (§Decisions). |
+| Degrade never hang; play inside 60 % of 1200 s | `PlayBudgetFraction = 0.6`, pre-turn deadline check, `endEarly()`, `sampleEpisode` fitting, **536 s** absolute worst case (§Decisions). |
 | `num_agents` in every variant AND the cert fixture | **6** in `standard`, in `honest-town`, in `certification.game_config`, and `<SEATS>` = 6 in `tools/ci/docker_smoke.sh`. |
 
 ---
@@ -1401,12 +1377,11 @@ featured-match iframe. Everything is rendered as words and numerals a casual spe
    across a 14-turn episode and fills **zero** commissions; an all-`factor` table's mean score is
    strictly greater than an all-`magpie` table's on the same seed (the competent baseline is the one
    a prompt has to beat, and the log echoes both numbers so tuning drift is visible).
-3. **Fallback** — with no credentials `newLlmClient(config).disabled` is true, `decideAll` returns
-   scripted sentences for all six seats with **no network call**, and the batch-spacing sleep is
-   skipped (asserted on wall clock: a 14-turn disabled episode finishes in under 5 s).
+3. **Offline play** — explicitly scripted seats complete without network calls.
+   A model seat requires credentials and fails explicitly when they are missing.
 4. **Reply parsing** — the JSON reply parser accepts the documented shapes, caps `action` / `say` /
-   `notes` at their rune limits, rejects a missing or empty `action` as invalid (retryable), and
-   treats an unreadable-but-present `action` as **valid** (not retryable).
+   `notes` at their rune limits, rejects a missing or empty `action` as invalid, and
+   treats an unreadable-but-present `action` as **valid**.
 
 ### `tests/test_score.nim` and `tests/test_feasibility.nim`
 

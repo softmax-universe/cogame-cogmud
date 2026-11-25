@@ -199,5 +199,5 @@ and nothing tells it what it is allowed to DO.
 
 There is no other value. There is no bankruptcy (coin can never go negative), no
 elimination and no walkout: a seat that never connects plays with an empty
-operator prompt, and a model seat whose decision fails after retry ends the
+operator prompt, and a model seat whose decision fails ends the
 episode with an explicit failure rather than substituting a scripted action.

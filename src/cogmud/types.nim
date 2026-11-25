@@ -9,6 +9,15 @@ const
 type
   CogmudError* = object of CatchableError
 
+  FailureKind* = enum
+    episodeInconclusive = "episode_inconclusive"
+    playerError = "player_error"
+
+  GamePlayerFailure* = object
+    kind*: FailureKind
+    failed_policy_index*: int
+    message*: string
+
   PlayerConfig* = object
     name*: string
 
@@ -251,6 +260,8 @@ proc update*(config: var GameConfig, configJson: string) =
     config.llmTimeoutSeconds = node["llmTimeoutSeconds"].getInt()
   if node.hasKey("shutdownGraceSeconds"):
     config.shutdownGraceSeconds = node["shutdownGraceSeconds"].getInt()
+  if config.llmTimeoutSeconds <= 0:
+    raise newException(CogmudError, "llmTimeoutSeconds must be positive")
   if config.turns < 6:
     raise newException(CogmudError, "turns must be at least 6")
   if config.players.len > 0 and config.players.len != 6:

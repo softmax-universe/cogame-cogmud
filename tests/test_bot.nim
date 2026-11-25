@@ -1,6 +1,6 @@
 import cogmud/prompts
 ## Bounded-orders / legality assertion on the two scripted baselines, plus the
-## no-credentials fallback and the reply parser.
+## offline behavior and the reply parser.
 ##
 ## The baselines emit English that the SAME parseSentence reads, so a full
 ## scripted episode is a live, per-episode test of the parser: zero unreadable
@@ -247,7 +247,7 @@ suite "no implicit fallback":
     expect ModelDecisionError:
       discard client.decideAll(PromptSelection(), sim, seats, prompts, scripted)
 
-  test "a dead endpoint retries once and fails explicitly with no scripted fallback":
+  test "a dead endpoint fails explicitly with no scripted fallback":
     ## The endpoint is 127.0.0.1:9 - discard, always refused - so this drives
     ## the real transport-failure path without touching the network.
     let saved = clearLlmEnv()
@@ -304,7 +304,7 @@ suite "reply parsing":
       """{"action":"I go\nto the Docks."}"""))
     check "\n" notin newlines.sentence
 
-  test "a missing, empty, or wrong-typed field is invalid and therefore retryable":
+  test "a missing, empty, or wrong-typed field is invalid":
     expect CogmudError:
       discard parseDecision(parseJson("""{"say":"hello"}"""))
     expect CogmudError:
@@ -318,7 +318,7 @@ suite "reply parsing":
     expect CogmudError:
       discard parseDecision(parseJson("""{"action":"I wait.","notes":[]}"""))
 
-  test "an unreadable but present action is VALID, never a retry":
+  test "an unreadable but present action is a legal no-op":
     ## The seat said something; the town did not understand it. That is a legal
     ## no-op with a recorded reason, not a transport failure.
     let decision = parseDecision(parseJson(
@@ -327,17 +327,19 @@ suite "reply parsing":
     let sim = initSim(fixtureConfig(seed = 92))
     check parseSentence(sim, 0, decision.sentence).kind == iNone
 
-  test "raw JSON and standard outer Markdown JSON fences are accepted; prose is rejected":
-    check parseDecision(extractJsonObject(
-      """{"action": "I wait."}""")).sentence == "I wait."
-    check parseDecision(extractJsonObject(
-      "```json\n{\"action\": \"I wait.\"}\n```")).sentence == "I wait."
-    check parseDecision(extractJsonObject(
-      "```\n{\"action\": \"I wait.\"}\n```")).sentence == "I wait."
-    expect CogmudError:
-      discard extractJsonObject("Sure! {\"action\": \"I wait.\"} Hope that helps.")
-    expect CogmudError:
-      discard extractJsonObject("no object here at all")
+  test "accept one bare or outer-fenced JSON decision":
+    let action = """{"action":"I wait."}"""
+    let blockText = "```json\n" & action & "\n```"
+    for valid in [action, blockText, "```\r\n" & action & "\r\n```"]:
+      check parseDecision(extractJsonObject(valid)).sentence == "I wait."
+    let speech = %*{"action": "I wait.", "say": "I heard \"and/or\"."}
+    check parseDecision(extractJsonObject($speech)).say == speech["say"].getStr()
+    for invalid in ["""{/* explanation */"action":"I wait."}""", "preface " & action, action & " afterword", action & action,
+        "```python\n" & action & "\n```", blockText & "\n" & blockText,
+        "preface\n" & blockText, "```json\n" & action & "\n" & action & "\n```",
+        "```json\n{\"sentence\":\"I wait.\"}\n```"]:
+      expect CogmudError:
+        discard parseDecision(extractJsonObject(invalid))
 
   test "cleanText cuts on a rune boundary and marks the cut":
     let cut = cleanText("\u00E9".repeat(50), 10)

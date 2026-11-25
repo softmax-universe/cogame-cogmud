@@ -120,7 +120,7 @@
           "default": 900
         },
         "llmTimeoutSeconds": {
-          "description": "Wall clock for one batch of six. The single retry batch gets half of it, floored at 8 s, so a turn costs at most llmTimeoutSeconds + max(8, llmTimeoutSeconds div 2).",
+          "description": "Timeout in seconds for the parallel batch of model requests in each turn.",
           "type": "integer",
           "minimum": 5,
           "maximum": 300,

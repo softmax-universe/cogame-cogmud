@@ -212,62 +212,34 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
   quit(0)
 
 proc failEpisode(
-  seat: int,
-  reason: string,
-  rawResponse: string,
+  failure: GamePlayerFailure,
   captureViews: seq[JsonNode],
-  attempts: seq[seq[DecisionAttempt]]
+  attempts: seq[seq[DecisionAttempt]],
+  rejectedSeats: array[Seats, bool] = default(array[Seats, bool])
 ) =
-  var failurePayload: JsonNode
+  let seat = failure.failed_policy_index
+  let failurePayload = %failure
   withLock stateLock:
     if state.finished:
       return
     state.finished = true
-    let results = state.sim.resultsJson()
-    let playerName =
-      if seat >= 0 and seat < state.config.players.len:
-        state.config.players[seat].name
-      else:
-        ""
-    failurePayload = %*{
-      "seat": seat,
-      "player": playerName,
-      "turn": state.sim.turn,
-      "reason": reason,
-      "raw_response": rawResponse
-    }
     if not state.trajectory.isNil:
-      let view =
-        if seat >= 0 and seat < captureViews.len and not captureViews[seat].isNil:
-          captureViews[seat]
-        elif seat >= 0 and seat < Seats:
-          state.sim.playerStateJson(seat)
-        else:
-          newJObject()
-      let seatAttempts =
-        if seat >= 0 and seat < attempts.len: attempts[seat]
-        else: @[]
+      # A simultaneous batch ends before any action resolves. Preserve the
+      # other seats' sampled replies as unexecuted.
+      for other, evidence in attempts:
+        if other != seat and evidence.len > 0:
+          state.trajectory.recordFailedDecision(state.sim.events.len, other,
+            captureViews[other], evidence, state.selection,
+            "turn aborted before resolution", if rejectedSeats[other]: asRejected else: asMissing)
       state.trajectory.recordFailedDecision(state.sim.events.len, seat,
-        playerName, view, seatAttempts, state.selection, reason)
-      state.trajectory.finishFailedNativeTrajectory(failurePayload, results)
-    var aliasNames = newJArray()
-    for name in state.sim.names:
-      aliasNames.add(%name)
-    var final = %*{
-      "type": "final",
-      "done": true,
-      "scores": results["scores"],
-      "names": aliasNames,
-      "wealth": results["wealth"],
-      "questPoints": results["questPoints"],
-      "turns": results["turns"],
-      "reason": "failed",
-      "error": reason
-    }
+        captureViews[seat], attempts[seat], state.selection, failure.message,
+        if failure.kind == playerError: asRejected else: asMissing)
+      state.trajectory.finishFailedNativeTrajectory(failurePayload)
+    var final = %*{"type": "final", "done": true, "reason": "failed",
+      "failure": failurePayload}
     for slot, socket in state.playerSockets:
       final["slot"] = %slot
       socket.send($final)
-    state.broadcastLocked()
 
   sleep(500)
   let failureUri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
@@ -277,7 +249,7 @@ proc failEpisode(
       failureUri, $failurePayload, "application/json",
       "COGAME_PLAYER_FAILURE_METHOD"
     )
-  echo "cogmud: episode failed (seat ", seat, "): ", reason
+  echo "cogmud: episode failed (seat ", seat, "): ", failure.message
   quit(1)
 
 proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
@@ -375,13 +347,11 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       try:
         decisions = client.decideAll(state.selection, simCopy, seats, prompts, scripted)
       except ModelDecisionError as error:
-        failEpisode(error.seat, error.msg, error.rawResponse, captureViews,
-          client.nativeAttempts)
+        failEpisode(GamePlayerFailure(kind: error.kind, failed_policy_index: error.seat,
+          message: error.msg), captureViews,
+          client.nativeAttempts, error.rejectedSeats)
 
-      var applyFailed = false
-      var applyFailSeat = -1
-      var applyFailReason = ""
-      var applyFailRaw = ""
+      var applyFailure: GamePlayerFailure
       withLock stateLock:
         let firstEvent = state.sim.events.len
         for index, seat in seats:
@@ -394,12 +364,10 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             state.sim.applyAction(seat, decision.sentence, decision.say,
               decision.notes, wasScripted)
           except CogmudError as error:
-            applyFailed = true
-            applyFailSeat = seat
-            applyFailReason = "engine rejected action: " & error.msg
-            applyFailRaw = $decision.decisionReply()
+            applyFailure = GamePlayerFailure(kind: playerError, failed_policy_index: seat,
+              message: "engine rejected action: " & error.msg)
             break
-        if not applyFailed:
+        if applyFailure.message.len == 0:
           if not state.trajectory.isNil:
             for eventIndex in firstEvent ..< state.sim.events.len:
               let applied = state.sim.events[eventIndex]
@@ -410,9 +378,8 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
                 scripted[seat] != skNone, client.nativeAttempts[seat],
                 state.selection)
           state.broadcastLocked()
-      if applyFailed:
-        failEpisode(applyFailSeat, applyFailReason, applyFailRaw, captureViews,
-          client.nativeAttempts)
+      if applyFailure.message.len > 0:
+        failEpisode(applyFailure, captureViews, client.nativeAttempts)
 
       ## Pace between turns so spectators can read the town.
       if config.turnDelayMs > 0:

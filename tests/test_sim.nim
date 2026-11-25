@@ -1114,11 +1114,11 @@ suite "episode budget":
     for index in 0 ..< Seats:
       config.players.add(PlayerConfig(name: "P" & $index))
       config.tokens.add("t")
-    check turnBudgetSeconds(config) == 36
+    check turnBudgetSeconds(config) == 24
     let fitted = sampleEpisode(config)
     check fitted.turns == 14
     check fitted.sampled
-    ## 14 turns x 36 s + 180 s connect + 20 s pacing = 704 s < 720 s.
+    ## 14 turns x 24 s + 180 s connect + 20 s pacing = 536 s < 720 s.
     check fitted.turns * turnBudgetSeconds(fitted) +
       int(fitted.playerConnectTimeoutSeconds) + PacingBudgetMs div 1000 <
       int(PlayBudgetFraction * fitted.episodeTimeoutSeconds.float)
