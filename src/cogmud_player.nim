@@ -78,7 +78,10 @@ when isMainModule:
           ## raced the server's slot registration.
           socket.send(promptFrame())
         of "final":
-          echo "cogmud player: final scores ", payload{"scores"}
+          if payload{"reason"}.getStr() == "failed":
+            echo "cogmud player: episode failed: ", payload{"failure", "message"}.getStr()
+          else:
+            echo "cogmud player: final scores ", payload["scores"]
           break
         else:
           discard

@@ -10,8 +10,8 @@ proc initNativeTrajectory*(config: GameConfig): DecisionTrajectory =
   newDecisionTrajectory(getEnv("COWORLD_EPISODE_ID"), "cogmud-" & $config.seed,
     "cogmud", getEnv("COWORLD_GAME_VERSION"), getEnv("COWORLD_SOURCE_REVISION"))
 
-proc nativeAttempt*(policy: string, turn, seat, retry: int, body: string): DecisionAttempt =
-  result = newDecisionAttempt($turn & "-" & $seat & "-attempt-" & $retry, policy, aoModel)
+proc nativeAttempt*(policy: string, turn, seat: int, body: string): DecisionAttempt =
+  result = newDecisionAttempt($turn & "-" & $seat & "-attempt-0", policy, aoModel)
   result.request = parseJson(body)
   result.prompt = %*[{"role": "system", "content": result.request["system"]}]
   for message in result.request["messages"]: result.prompt.add(copy(message))
@@ -20,12 +20,7 @@ proc nativeAttempt*(policy: string, turn, seat, retry: int, body: string): Decis
     if key notin ["model", "system", "messages", "anthropic_version"]:
       result.decoder[key] = copy(value)
 
-proc receiveNativeResponse*(attempt: var DecisionAttempt, response: Response,
-    transportError: string, latencyMs: int) =
-  # Curly returns received, decompressed body bytes and parsed headers. Do not
-  # manufacture a raw HTTP header block or claim unexposed transport facts.
-  attempt.rawResponse = %response.body
-  attempt.latencyMs = some(latencyMs.float)
+proc receiveNativeHeaders*(attempt: var DecisionAttempt, response: Response) =
   for (header, field) in [
       ("x-softmax-llm-call-id", "call"),
       ("x-coworld-checkpoint-sha256", "model"),
@@ -38,8 +33,8 @@ proc receiveNativeResponse*(attempt: var DecisionAttempt, response: Response,
       of "model": attempt.modelIdentity = some(value)
       of "tokenizer": attempt.tokenizerIdentity = some(value)
       of "template": attempt.chatTemplateSha256 = some(value)
-  if transportError.len > 0 or response.code < 200 or response.code >= 300: return
-  let payload = parseJson(response.body)
+
+proc receiveNativeMessage*(attempt: var DecisionAttempt, payload: JsonNode, text: string) =
   if payload.hasKey("model") and payload["model"].kind == JString:
     attempt.model = some(payload["model"].getStr())
   if payload.hasKey("stop_reason") and payload["stop_reason"].kind == JString:
@@ -48,9 +43,6 @@ proc receiveNativeResponse*(attempt: var DecisionAttempt, response: Response,
   if not usage.isNil and usage.kind == JObject:
     if usage.hasKey("input_tokens") and usage["input_tokens"].kind == JInt: attempt.inputTokens = some(usage["input_tokens"].getInt())
     if usage.hasKey("output_tokens") and usage["output_tokens"].kind == JInt: attempt.outputTokens = some(usage["output_tokens"].getInt())
-  var text = ""
-  for part in payload["content"]:
-    if part{"type"}.getStr() == "text": text.add(part{"text"}.getStr())
   attempt.response = %text
 
 proc recordAppliedDecision*(trajectory: DecisionTrajectory, eventIndex, seat: int,
@@ -84,8 +76,8 @@ proc recordAppliedDecision*(trajectory: DecisionTrajectory, eventIndex, seat: in
     selected, applied, status)
 
 proc recordFailedDecision*(trajectory: DecisionTrajectory, eventIndex, seat: int,
-    policy: string, observation: JsonNode, evidence: seq[DecisionAttempt],
-    selection: PromptSelection, reason: string) =
+    observation: JsonNode, evidence: seq[DecisionAttempt],
+    selection: PromptSelection, reason: string, status: ActionStatus) =
   if trajectory.isNil: return
   var attempts = evidence
   for attempt in attempts.mitems:
@@ -99,7 +91,6 @@ proc recordFailedDecision*(trajectory: DecisionTrajectory, eventIndex, seat: int
       view["prompt_attempts"].add(%*{"attempt_id": attempt.attemptId,
         "prompt_template": promptMetadata(selection, attempt.request["system"].getStr(),
           attempt.request["messages"][0]["content"].getStr())})
-  let status = if attempts.len > 0: asRejected else: asMissing
   trajectory.recordDecision("event-" & $eventIndex & "-failed-" & $seat, $seat,
     view, attempts, none(string), newJNull(), status, terminal = true)
 
@@ -112,9 +103,7 @@ proc finishNativeTrajectory*(trajectory: DecisionTrajectory, outcome: JsonNode) 
   trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
 
 proc finishFailedNativeTrajectory*(trajectory: DecisionTrajectory,
-    failureOutcome, results: JsonNode) =
+    failureOutcome: JsonNode) =
   if trajectory.isNil: return
-  var scores = newJObject()
-  for seat in 0 ..< Seats: scores[$seat] = results["scores"][seat]
-  trajectory.finish(esFailed, failureOutcome, scores)
+  trajectory.finish(esFailed, failureOutcome, newJObject())
   trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))

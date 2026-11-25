@@ -17,9 +17,10 @@ from pathlib import Path
 
 
 class FixtureServer(ThreadingHTTPServer):
-    def __init__(self, address, handler, *, fail_turn=None):
+    def __init__(self, address, handler, *, fail_turn=None, http_status=200):
         super().__init__(address, handler)
         self.fail_turn = fail_turn
+        self.http_status = http_status
         self.calls_lock = threading.Lock()
         self.called_slots = []
 
@@ -41,11 +42,9 @@ class Provider(BaseHTTPRequestHandler):
         assert "PRIVATE_OPERATOR_" + slot in user
         assert all("PRIVATE_OPERATOR_" + str(i) not in user for i in range(6) if str(i) != slot)
         assert "SPECTATOR_POLICY_" not in user and "SPECTATOR_POLICY_" not in body["system"]
-        retry = "Your previous reply was invalid" in user
-        if self.server.fail_turn is not None and turn == self.server.fail_turn:
-            text = "invalid fixture reply"
-        elif turn == 1 and not retry:
-            text = "invalid fixture reply"
+        failed_call = turn == self.server.fail_turn and slot == "5"
+        if failed_call or (turn == self.server.fail_turn and slot == "2" and self.server.http_status != 200):
+            text = 'invalid fixture reply before {"action":"I wait."}'
         else:
             notes = "PRIVATE_CAPTURE_" + slot
             if turn == 3:
@@ -60,8 +59,9 @@ class Provider(BaseHTTPRequestHandler):
                 action.pop("say")
                 action.pop("notes")
             text = json.dumps(action)
-            if turn == 2:
-                text = f"```json\n{text}\n```"
+            if turn in (2, 3):
+                label = "json" if turn == 2 else ""
+                text = f"```{label}\n{text}\n```"
         response = json.dumps(
             {
                 "model": body["model"],
@@ -70,7 +70,7 @@ class Provider(BaseHTTPRequestHandler):
                 "usage": None if turn == 5 else {"input_tokens": 100, "output_tokens": 20},
             }
         ).encode()
-        self.send_response(200)
+        self.send_response(self.server.http_status if failed_call else 200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(response)))
         self.send_header("X-Softmax-Llm-Call-Id", str(uuid.uuid5(uuid.NAMESPACE_URL, raw.decode())))
@@ -90,6 +90,7 @@ def run(
     model_enabled=True,
     fail_turn=None,
     expect_failure=False,
+    http_status=200,
 ):
     root = output / label
     root.mkdir(mode=0o700)
@@ -98,9 +99,10 @@ def run(
     config.update(
         seed=42,
         turnDelayMs=0,
+        shutdownGraceSeconds=0,
         players=[{"name": f"SPECTATOR_POLICY_{i}"} for i in range(seats)],
         llmTimeoutSeconds=1,
-        playerConnectTimeoutSeconds=5,
+        player_connect_timeout_seconds=5,
         episodeTimeoutSeconds=600,
         tokens=[f"fixture-{i}" for i in range(seats)],
     )
@@ -133,7 +135,7 @@ def run(
     )
     if not capture:
         env.pop("COGAME_SAVE_TRAJECTORY_URI")
-    provider = FixtureServer(("127.0.0.1", 0), Provider, fail_turn=fail_turn)
+    provider = FixtureServer(("127.0.0.1", 0), Provider, fail_turn=fail_turn, http_status=http_status)
     thread = threading.Thread(target=provider.serve_forever, daemon=True)
     thread.start()
     if model_enabled:
@@ -171,23 +173,41 @@ def run(
         for child in children[1:]:
             assert child.wait(timeout=10) == 0
 
+        model_seats = {seat for seat, mode in enumerate(seat_modes) if not mode}
+        last_turn = (fail_turn or config["turns"]) if model_enabled else 0
+        assert sorted(provider.called_slots) == [
+            (turn, seat) for turn in range(1, last_turn + 1) for seat in sorted(model_seats)
+        ]
         if expect_failure:
             assert rc != 0, f"expected explicit failure for {label}, got exit 0"
             assert not (root / "results.json").exists(), "failed episode must not write results.json"
             failure = json.loads((root / "player_failure.json").read_text())
-            assert failure["reason"]
-            if fail_turn is not None:
-                assert "invalid fixture reply" in failure["raw_response"]
+            assert set(failure) == {"kind", "failed_policy_index", "message"}
+            infrastructure = not model_enabled or http_status != 200
+            assert failure["kind"] == ("episode_inconclusive" if infrastructure else "player_error")
+            assert failure["failed_policy_index"] == (5 if model_enabled else 0)
+            assert failure["message"] and "invalid fixture reply" not in failure["message"]
+            for seat in range(seats):
+                player_log = (root / f"player-{seat}.log").read_text()
+                assert "final scores" not in player_log and "episode failed" in player_log
             if capture:
                 trace = root / "trajectory.jsonl"
                 rows = [json.loads(line) for line in trace.read_text().splitlines()]
                 assert rows[-1]["status"] == "failed"
+                assert rows[-1]["outcome"] == failure
+                assert rows[-1]["participant_outcomes"] == {}
                 failed_row = rows[-2]
                 assert failed_row["selected_attempt_id"] is None
                 assert failed_row["executed_action"] is None
                 if fail_turn is not None:
-                    assert failed_row["action_status"] == "rejected"
-                    assert len(failed_row["attempts"]) == 2
+                    assert failed_row["action_status"] == ("missing" if infrastructure else "rejected")
+                    batch = [r for r in rows[:-1] if r["terminal"]]
+                    assert {int(r["seat"]) for r in batch} == {0, 2, 5}
+                    assert all(r["executed_action"] is None for r in batch)
+                    assert all(len(r["attempts"]) == 1 for r in batch)
+                    if infrastructure:
+                        sibling = next(r for r in batch if int(r["seat"]) == 2)
+                        assert sibling["action_status"] == "rejected"
                     assert all(not a["accepted"] for a in failed_row["attempts"])
                     assert "invalid fixture reply" in failed_row["attempts"][-1]["raw_response"]
                 else:
@@ -200,13 +220,6 @@ def run(
         replay = json.loads((root / "replay.json").read_text())
         assert results["reason"] == "complete"
         assert results["turns"] == config["turns"] == 14
-
-        model_seats = {seat for seat, mode in enumerate(seat_modes) if not mode}
-        called_seat_ids = {slot for _, slot in provider.called_slots}
-        if model_seats:
-            assert called_seat_ids == model_seats, f"expected HTTP calls for {model_seats}, got {called_seat_ids}"
-        else:
-            assert not called_seat_ids, f"scripted-only game should make zero HTTP calls, got {called_seat_ids}"
 
         events = [event for event in replay["events"] if event["kind"] == "act"]
         assert len(events) == 84
@@ -252,11 +265,8 @@ def run(
                     assert row["attempts"][0]["platform_call_id"] is None
                     continue
                 attempts = row["attempts"]
-                if turn == 1:
-                    assert len(attempts) == 2 and not attempts[0]["accepted"]
-                    assert attempts[1]["accepted"]
-                    assert row["selected_attempt_id"] == attempts[1]["attempt_id"]
-                elif turn == 3:
+                assert len(attempts) == 1
+                if turn == 3:
                     assert row["action_status"] == "rejected" and row["selected_attempt_id"] is None
                     assert not attempts[0]["accepted"]
                 elif turn == 6:
@@ -269,7 +279,6 @@ def run(
                     assert row["selected_attempt_id"] == attempts[-1]["attempt_id"]
                     if turn == 4:
                         assert event["reason"] == "no_verb"
-                        assert len(attempts) == 1, "legal no-op must not trigger a retry"
                 if turn == 5:
                     assert attempts[0]["input_tokens"] is None and attempts[0]["output_tokens"] is None
                 for attempt in attempts:
@@ -328,11 +337,17 @@ def main():
     )
     assert captured == ordinary, "capture changed the baseline-only game"
 
-    # Unrecovered model reply failure ends explicitly and preserves raw data.
+    # Invalid model reply ends explicitly and preserves raw data.
     run(
         game, player, destination, manifest["variants"][0], True,
         label="standard-model-reply-failure", seat_modes=mixed_modes,
         model_enabled=True, fail_turn=2, expect_failure=True,
+    )
+
+    run(
+        game, player, destination, manifest["variants"][0], True,
+        label="standard-provider-failure", seat_modes=mixed_modes,
+        fail_turn=2, http_status=503, expect_failure=True,
     )
 
     # Model seat with no credentials fails explicitly (no implicit fallback).
@@ -343,7 +358,7 @@ def main():
     )
 
     print(
-        "eight native games: HTTP model vs explicit baselines, replay parity, retries, "
+        "nine native games: HTTP model vs explicit baselines, replay parity, single requests, "
         "markdown JSON fence, normalization, legal no-op, privacy, missing usage, "
         "offline baselines, and explicit failure without fallback pass"
     )

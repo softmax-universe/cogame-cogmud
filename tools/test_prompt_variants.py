@@ -48,7 +48,7 @@ for game, maximum in (("standard", 84), ("honest-town", 84)):
                     metadata = view.pop("prompt_template")
                     selected = TRAIN[prompt_seed] if choice == "mixed" else choice
                     assert metadata == {
-                        "bank": "cogmud-rules-v2",
+                        "bank": "cogmud-rules-v3",
                         "variant": selected,
                         "selection": choice,
                         "seed": prompt_seed,

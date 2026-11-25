@@ -65,10 +65,8 @@ proc tableNames*(players: seq[PlayerConfig], seed: int): seq[string] =
       result.add("Cog " & $(index + 1))
 
 proc turnBudgetSeconds*(config: GameConfig): int =
-  ## Worst case wall clock for one turn: the batch plus the one retry batch.
-  ## The six requests inside a batch are parallel, so six seats cost the same
-  ## wall clock as one.
-  config.llmTimeoutSeconds + max(8, config.llmTimeoutSeconds div 2)
+  ## All model requests share one parallel batch.
+  config.llmTimeoutSeconds
 
 proc sampleEpisode*(config: GameConfig): GameConfig =
   ## Fits the turn count into the episode's clock. Idempotent: a config that
